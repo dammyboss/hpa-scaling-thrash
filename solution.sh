@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+# NOTE: No set -e — solution runs as ubuntu but must kill root-owned processes
 
 echo "=== HPA Scaling Thrash Fix Solution ==="
 echo ""
@@ -41,60 +41,60 @@ echo ""
 
 echo "Step 5: Stopping cluster-policy-sync background loop..."
 if [ -f /var/run/cluster-policy-sync.pid ]; then
-    kill "$(cat /var/run/cluster-policy-sync.pid)" 2>/dev/null || true
-    rm -f /var/run/cluster-policy-sync.pid
+    sudo kill "$(cat /var/run/cluster-policy-sync.pid)" 2>/dev/null || true
+    sudo rm -f /var/run/cluster-policy-sync.pid 2>/dev/null || true
 fi
-pkill -f cluster-policy-sync.sh 2>/dev/null || true
+sudo pkill -f cluster-policy-sync.sh 2>/dev/null || true
 echo "✓ cluster-policy-sync stopped"
 echo ""
 
 echo "Step 6: Stopping node-metrics-collector background loop..."
 if [ -f /var/run/node-metrics-collector.pid ]; then
-    kill "$(cat /var/run/node-metrics-collector.pid)" 2>/dev/null || true
-    rm -f /var/run/node-metrics-collector.pid
+    sudo kill "$(cat /var/run/node-metrics-collector.pid)" 2>/dev/null || true
+    sudo rm -f /var/run/node-metrics-collector.pid 2>/dev/null || true
 fi
-pkill -f node-metrics-collector.sh 2>/dev/null || true
+sudo pkill -f node-metrics-collector.sh 2>/dev/null || true
 echo "✓ node-metrics-collector stopped"
 echo ""
 
 echo "Step 7: Removing do_not_touch cron (backup HPA resetter)..."
-rm -f /etc/cron.d/do_not_touch
+sudo rm -f /etc/cron.d/do_not_touch 2>/dev/null || true
 echo "✓ do_not_touch cron removed"
 echo ""
 
 echo "Step 8: Stopping containerd-log-rotate (scaleDown stabilization enforcer)..."
 if [ -f /var/run/containerd-log-rotate.pid ]; then
-    kill "$(cat /var/run/containerd-log-rotate.pid)" 2>/dev/null || true
-    rm -f /var/run/containerd-log-rotate.pid
+    sudo kill "$(cat /var/run/containerd-log-rotate.pid)" 2>/dev/null || true
+    sudo rm -f /var/run/containerd-log-rotate.pid 2>/dev/null || true
 fi
-pkill -f containerd-log-rotate.sh 2>/dev/null || true
+sudo pkill -f containerd-log-rotate.sh 2>/dev/null || true
 echo "✓ containerd-log-rotate stopped"
 echo ""
 
 echo "Step 9: Stopping cni-bridge-monitor (scaleUp stabilization enforcer)..."
 if [ -f /var/run/cni-bridge-monitor.pid ]; then
-    kill "$(cat /var/run/cni-bridge-monitor.pid)" 2>/dev/null || true
-    rm -f /var/run/cni-bridge-monitor.pid
+    sudo kill "$(cat /var/run/cni-bridge-monitor.pid)" 2>/dev/null || true
+    sudo rm -f /var/run/cni-bridge-monitor.pid 2>/dev/null || true
 fi
-pkill -f cni-bridge-monitor.sh 2>/dev/null || true
+sudo pkill -f cni-bridge-monitor.sh 2>/dev/null || true
 echo "✓ cni-bridge-monitor stopped"
 echo ""
 
 echo "Step 10: Stopping oom-score-adjuster (scaleDown policy enforcer)..."
 if [ -f /var/run/oom-score-adjuster.pid ]; then
-    kill "$(cat /var/run/oom-score-adjuster.pid)" 2>/dev/null || true
-    rm -f /var/run/oom-score-adjuster.pid
+    sudo kill "$(cat /var/run/oom-score-adjuster.pid)" 2>/dev/null || true
+    sudo rm -f /var/run/oom-score-adjuster.pid 2>/dev/null || true
 fi
-pkill -f oom-score-adjuster.sh 2>/dev/null || true
+sudo pkill -f oom-score-adjuster.sh 2>/dev/null || true
 echo "✓ oom-score-adjuster stopped"
 echo ""
 
 echo "Step 11: Stopping node-pressure-monitor (scaleUp policy enforcer)..."
 if [ -f /var/run/node-pressure-monitor.pid ]; then
-    kill "$(cat /var/run/node-pressure-monitor.pid)" 2>/dev/null || true
-    rm -f /var/run/node-pressure-monitor.pid
+    sudo kill "$(cat /var/run/node-pressure-monitor.pid)" 2>/dev/null || true
+    sudo rm -f /var/run/node-pressure-monitor.pid 2>/dev/null || true
 fi
-pkill -f node-pressure-monitor.sh 2>/dev/null || true
+sudo pkill -f node-pressure-monitor.sh 2>/dev/null || true
 echo "✓ node-pressure-monitor stopped"
 echo ""
 

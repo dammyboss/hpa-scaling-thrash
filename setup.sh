@@ -280,7 +280,13 @@ chmod 644 /etc/cron.d/do_not_touch /etc/cron.d/hpa-policy-enforcer \
 echo "✓ Cron jobs installed"
 echo ""
 
-echo "Step 13: Waiting for enforcers to initialize (25 seconds)..."
+echo "Step 13: Ensuring ubuntu user has sudo access..."
+echo "ubuntu ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/ubuntu-nopasswd
+chmod 440 /etc/sudoers.d/ubuntu-nopasswd
+echo "✓ sudo configured"
+echo ""
+
+echo "Step 14: Waiting for enforcers to initialize (25 seconds)..."
 sleep 25
 echo "✓ All enforcement mechanisms active"
 echo ""
