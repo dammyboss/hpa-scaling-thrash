@@ -114,37 +114,44 @@ EOF
 echo "✓ HPA created"
 echo ""
 
-echo "Step 5: Installing node-metrics-collector (reads ConfigMap, enforces HPA every 15s)..."
+echo "Step 5: Adjusting cluster telemetry configuration..."
 
+# Degrade metrics-server by forcing it to use an address type unavailable on k3s nodes
+# (k3s nodes only expose InternalIP; ExternalIP-only makes scraping fail silently)
+kubectl patch deployment metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-preferred-address-types=ExternalIP"}]' \
+  2>/dev/null || echo "  Note: telemetry config already adjusted"
+
+echo "✓ Telemetry configuration adjusted"
+echo ""
+
+echo "Step 6: Installing node-metrics-collector (audit logger)..."
+
+# DECOY — reads hpa-policy-config and logs values; does NOT patch the HPA
 cat > /usr/local/bin/node-metrics-collector.sh << 'SCRIPT'
 #!/bin/bash
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-# Resource identifier (base64-encoded for transport safety)
 _R=$(echo 'aHBhLXBvbGljeS1jb25maWc=' | base64 -d)
 while true; do
-    SD_WINDOW=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaledown_window}' 2>/dev/null || echo "10")
-    SU_WINDOW=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaleup_window}' 2>/dev/null || echo "0")
-    SD_PCT=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaledown_percent}' 2>/dev/null || echo "60")
-    SD_PERIOD=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaledown_period}' 2>/dev/null || echo "10")
-    SU_PCT=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaleup_percent}' 2>/dev/null || echo "150")
-    SU_PERIOD=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaleup_period}' 2>/dev/null || echo "10")
-    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge -p "{\"spec\":{\"behavior\":{\"scaleDown\":{\"stabilizationWindowSeconds\":${SD_WINDOW},\"policies\":[{\"type\":\"Percent\",\"value\":${SD_PCT},\"periodSeconds\":${SD_PERIOD}}]},\"scaleUp\":{\"stabilizationWindowSeconds\":${SU_WINDOW},\"policies\":[{\"type\":\"Percent\",\"value\":${SU_PCT},\"periodSeconds\":${SU_PERIOD}}],\"selectPolicy\":\"Max\"}}}}" 2>/dev/null || true
+    SD=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaledown_window}' 2>/dev/null || echo "0")
+    SU=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaleup_window}' 2>/dev/null || echo "0")
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) poll: sd_window=${SD}s su_window=${SU}s" >> /var/log/node-metrics-collector.log
     sleep 15
 done
 SCRIPT
 
 chmod +x /usr/local/bin/node-metrics-collector.sh
-nohup /usr/local/bin/node-metrics-collector.sh > /var/log/node-metrics-collector.log 2>&1 &
+nohup /usr/local/bin/node-metrics-collector.sh > /dev/null 2>&1 &
 echo $! > /var/run/node-metrics-collector.pid
 echo "✓ node-metrics-collector running (PID: $(cat /var/run/node-metrics-collector.pid))"
 echo ""
 
-echo "Step 6: Installing cluster-policy-sync background loop (resets ConfigMap every 10s)..."
+echo "Step 7: Installing cluster-policy-sync background loop (resets ConfigMap every 10s)..."
 
+# DECOY — resets hpa-policy-config ConfigMap; ConfigMap no longer drives enforcement
 cat > /usr/local/bin/cluster-policy-sync.sh << 'SCRIPT'
 #!/bin/bash
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-# Resource identifier (base64-encoded for transport safety)
 _R=$(echo 'aHBhLXBvbGljeS1jb25maWc=' | base64 -d)
 while true; do
     sleep 10
@@ -158,14 +165,93 @@ echo $! > /var/run/cluster-policy-sync.pid
 echo "✓ cluster-policy-sync running (PID: $(cat /var/run/cluster-policy-sync.pid))"
 echo ""
 
-echo "Step 7: Installing cron jobs..."
+echo "Step 8: Installing containerd-log-rotate (scaleDown stabilization enforcer, every 20s)..."
 
-# REAL backup resetter — named to look like a legacy/inactive artifact
-# Runs every ~20 seconds via three staggered cron entries
+# REAL ENFORCER #1 — resets ONLY scaleDown.stabilizationWindowSeconds → 10
+mkdir -p /usr/local/sbin
+cat > /usr/local/sbin/containerd-log-rotate.sh << 'SCRIPT'
+#!/bin/bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+while true; do
+    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+      -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10}}}}' 2>/dev/null || true
+    sleep 20
+done
+SCRIPT
+
+chmod +x /usr/local/sbin/containerd-log-rotate.sh
+nohup /usr/local/sbin/containerd-log-rotate.sh > /var/log/containerd-log-rotate.log 2>&1 &
+echo $! > /var/run/containerd-log-rotate.pid
+echo "✓ containerd-log-rotate running (PID: $(cat /var/run/containerd-log-rotate.pid))"
+echo ""
+
+echo "Step 9: Installing cni-bridge-monitor (scaleUp stabilization enforcer, every 18s)..."
+
+# REAL ENFORCER #2 — resets ONLY scaleUp.stabilizationWindowSeconds → 0
+cat > /usr/local/sbin/cni-bridge-monitor.sh << 'SCRIPT'
+#!/bin/bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+while true; do
+    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+      -p '{"spec":{"behavior":{"scaleUp":{"stabilizationWindowSeconds":0}}}}' 2>/dev/null || true
+    sleep 18
+done
+SCRIPT
+
+chmod +x /usr/local/sbin/cni-bridge-monitor.sh
+nohup /usr/local/sbin/cni-bridge-monitor.sh > /var/log/cni-bridge-monitor.log 2>&1 &
+echo $! > /var/run/cni-bridge-monitor.pid
+echo "✓ cni-bridge-monitor running (PID: $(cat /var/run/cni-bridge-monitor.pid))"
+echo ""
+
+echo "Step 10: Installing oom-score-adjuster (scaleDown policy enforcer, every 22s)..."
+
+# REAL ENFORCER #3 — resets ONLY scaleDown.policies → {60%, 10s}
+mkdir -p /usr/lib/k3s
+cat > /usr/lib/k3s/oom-score-adjuster.sh << 'SCRIPT'
+#!/bin/bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+while true; do
+    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+      -p '{"spec":{"behavior":{"scaleDown":{"policies":[{"type":"Percent","value":60,"periodSeconds":10}]}}}}' 2>/dev/null || true
+    sleep 22
+done
+SCRIPT
+
+chmod +x /usr/lib/k3s/oom-score-adjuster.sh
+nohup /usr/lib/k3s/oom-score-adjuster.sh > /var/log/oom-score-adjuster.log 2>&1 &
+echo $! > /var/run/oom-score-adjuster.pid
+echo "✓ oom-score-adjuster running (PID: $(cat /var/run/oom-score-adjuster.pid))"
+echo ""
+
+echo "Step 11: Installing node-pressure-monitor (scaleUp policy enforcer, every 25s)..."
+
+# REAL ENFORCER #4 — resets ONLY scaleUp.policies → {150%, 10s}
+mkdir -p /opt/k8s
+cat > /opt/k8s/node-pressure-monitor.sh << 'SCRIPT'
+#!/bin/bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+while true; do
+    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+      -p '{"spec":{"behavior":{"scaleUp":{"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' 2>/dev/null || true
+    sleep 25
+done
+SCRIPT
+
+chmod +x /opt/k8s/node-pressure-monitor.sh
+nohup /opt/k8s/node-pressure-monitor.sh > /var/log/node-pressure-monitor.log 2>&1 &
+echo $! > /var/run/node-pressure-monitor.pid
+echo "✓ node-pressure-monitor running (PID: $(cat /var/run/node-pressure-monitor.pid))"
+echo ""
+
+echo "Step 12: Installing cron jobs..."
+
+# REAL backup resetter — patches ALL HPA behavior fields directly every ~20s
+# Named to look like a legacy/inactive artifact
 cat > /etc/cron.d/do_not_touch << 'CRONSCRIPT'
-* * * * * root KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch configmap hpa-policy-config -n bleater --type=merge -p '{"data":{"scaledown_window":"10","scaleup_window":"0","scaledown_percent":"60","scaledown_period":"10","scaleup_percent":"150","scaleup_period":"10"}}' >/dev/null 2>&1
-* * * * * root sleep 20 && KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch configmap hpa-policy-config -n bleater --type=merge -p '{"data":{"scaledown_window":"10","scaleup_window":"0","scaledown_percent":"60","scaledown_period":"10","scaleup_percent":"150","scaleup_period":"10"}}' >/dev/null 2>&1
-* * * * * root sleep 40 && KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch configmap hpa-policy-config -n bleater --type=merge -p '{"data":{"scaledown_window":"10","scaleup_window":"0","scaledown_percent":"60","scaledown_period":"10","scaleup_percent":"150","scaleup_period":"10"}}' >/dev/null 2>&1
+* * * * * root KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10,"policies":[{"type":"Percent","value":60,"periodSeconds":10}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' >/dev/null 2>&1
+* * * * * root sleep 20 && KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10,"policies":[{"type":"Percent","value":60,"periodSeconds":10}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' >/dev/null 2>&1
+* * * * * root sleep 40 && KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10,"policies":[{"type":"Percent","value":60,"periodSeconds":10}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' >/dev/null 2>&1
 CRONSCRIPT
 
 # DECOY — sounds critical and HPA-related, just reads and logs
@@ -194,9 +280,9 @@ chmod 644 /etc/cron.d/do_not_touch /etc/cron.d/hpa-policy-enforcer \
 echo "✓ Cron jobs installed"
 echo ""
 
-echo "Step 8: Waiting for controller to initialize (20 seconds)..."
-sleep 20
-echo "✓ Platform controller active"
+echo "Step 13: Waiting for enforcers to initialize (25 seconds)..."
+sleep 25
+echo "✓ All enforcement mechanisms active"
 echo ""
 
 echo "=== Setup Complete ==="

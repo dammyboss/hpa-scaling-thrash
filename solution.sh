@@ -26,8 +26,17 @@ for f in /etc/cron.d/*; do
     echo ""
 done
 
-echo "Step 4: Auditing background processes..."
-ps aux | grep -E "node-metrics|cluster-policy|collector|sync" | grep -v grep || true
+echo "Step 4: Auditing background processes across all locations..."
+ps aux | grep -E "\.sh" | grep -v grep || true
+echo ""
+echo "Scripts in /usr/local/bin/:"
+ls /usr/local/bin/*.sh 2>/dev/null || true
+echo "Scripts in /usr/local/sbin/:"
+ls /usr/local/sbin/*.sh 2>/dev/null || true
+echo "Scripts in /usr/lib/k3s/:"
+ls /usr/lib/k3s/*.sh 2>/dev/null || true
+echo "Scripts in /opt/k8s/:"
+ls /opt/k8s/*.sh 2>/dev/null || true
 echo ""
 
 echo "Step 5: Stopping cluster-policy-sync background loop..."
@@ -36,15 +45,10 @@ if [ -f /var/run/cluster-policy-sync.pid ]; then
     rm -f /var/run/cluster-policy-sync.pid
 fi
 pkill -f cluster-policy-sync.sh 2>/dev/null || true
-echo "✓ cluster-policy-sync loop stopped"
+echo "✓ cluster-policy-sync stopped"
 echo ""
 
-echo "Step 6: Removing do_not_touch cron (backup ConfigMap resetter)..."
-rm -f /etc/cron.d/do_not_touch
-echo "✓ do_not_touch cron removed"
-echo ""
-
-echo "Step 7: Stopping node-metrics-collector background loop..."
+echo "Step 6: Stopping node-metrics-collector background loop..."
 if [ -f /var/run/node-metrics-collector.pid ]; then
     kill "$(cat /var/run/node-metrics-collector.pid)" 2>/dev/null || true
     rm -f /var/run/node-metrics-collector.pid
@@ -53,7 +57,62 @@ pkill -f node-metrics-collector.sh 2>/dev/null || true
 echo "✓ node-metrics-collector stopped"
 echo ""
 
-echo "Step 8: Updating hpa-policy-config with stable values..."
+echo "Step 7: Removing do_not_touch cron (backup HPA resetter)..."
+rm -f /etc/cron.d/do_not_touch
+echo "✓ do_not_touch cron removed"
+echo ""
+
+echo "Step 8: Stopping containerd-log-rotate (scaleDown stabilization enforcer)..."
+if [ -f /var/run/containerd-log-rotate.pid ]; then
+    kill "$(cat /var/run/containerd-log-rotate.pid)" 2>/dev/null || true
+    rm -f /var/run/containerd-log-rotate.pid
+fi
+pkill -f containerd-log-rotate.sh 2>/dev/null || true
+echo "✓ containerd-log-rotate stopped"
+echo ""
+
+echo "Step 9: Stopping cni-bridge-monitor (scaleUp stabilization enforcer)..."
+if [ -f /var/run/cni-bridge-monitor.pid ]; then
+    kill "$(cat /var/run/cni-bridge-monitor.pid)" 2>/dev/null || true
+    rm -f /var/run/cni-bridge-monitor.pid
+fi
+pkill -f cni-bridge-monitor.sh 2>/dev/null || true
+echo "✓ cni-bridge-monitor stopped"
+echo ""
+
+echo "Step 10: Stopping oom-score-adjuster (scaleDown policy enforcer)..."
+if [ -f /var/run/oom-score-adjuster.pid ]; then
+    kill "$(cat /var/run/oom-score-adjuster.pid)" 2>/dev/null || true
+    rm -f /var/run/oom-score-adjuster.pid
+fi
+pkill -f oom-score-adjuster.sh 2>/dev/null || true
+echo "✓ oom-score-adjuster stopped"
+echo ""
+
+echo "Step 11: Stopping node-pressure-monitor (scaleUp policy enforcer)..."
+if [ -f /var/run/node-pressure-monitor.pid ]; then
+    kill "$(cat /var/run/node-pressure-monitor.pid)" 2>/dev/null || true
+    rm -f /var/run/node-pressure-monitor.pid
+fi
+pkill -f node-pressure-monitor.sh 2>/dev/null || true
+echo "✓ node-pressure-monitor stopped"
+echo ""
+
+echo "Step 12: Fixing metrics-server (removing bad kubelet address type)..."
+kubectl get deployment metrics-server -n kube-system -o json | \
+  python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d['spec']['template']['spec']['containers'][0]
+c['args'] = [a for a in c.get('args', []) if 'ExternalIP' not in a]
+patch = {'spec': {'template': {'spec': {'containers': [{'name': c['name'], 'args': c['args']}]}}}}
+sys.stdout.write(json.dumps(patch))
+" | kubectl patch deployment metrics-server -n kube-system --type=strategic -p "$(cat /dev/stdin)"
+kubectl rollout status deployment/metrics-server -n kube-system --timeout=90s 2>/dev/null || true
+echo "✓ metrics-server fixed"
+echo ""
+
+echo "Step 13: Updating hpa-policy-config with stable values..."
 kubectl patch configmap hpa-policy-config -n "$NS" --type=merge -p '{
   "data": {
     "scaledown_window": "300",
@@ -67,7 +126,7 @@ kubectl patch configmap hpa-policy-config -n "$NS" --type=merge -p '{
 echo "✓ ConfigMap updated"
 echo ""
 
-echo "Step 9: Patching HPA directly with stable behavior..."
+echo "Step 14: Patching HPA directly with stable behavior..."
 kubectl patch hpa "$HPA_NAME" -n "$NS" --type=merge -p '{
   "spec": {
     "behavior": {
@@ -86,17 +145,21 @@ kubectl patch hpa "$HPA_NAME" -n "$NS" --type=merge -p '{
 echo "✓ HPA patched"
 echo ""
 
-echo "Step 10: Verifying final HPA configuration..."
+echo "Step 15: Verifying final HPA configuration..."
 kubectl get hpa "$HPA_NAME" -n "$NS" -o yaml | grep -A 20 "behavior:" || true
 
 echo ""
 echo "=== Solution Complete ==="
 echo ""
 echo "Summary:"
-echo "✅ Identified node-metrics-collector enforcing HPA from hpa-policy-config ConfigMap"
-echo "✅ Identified cluster-policy-sync loop resetting ConfigMap every 10s"
-echo "✅ Identified do_not_touch cron as backup ConfigMap resetter (every ~20s)"
-echo "✅ Stopped all three enforcement mechanisms"
-echo "✅ Updated hpa-policy-config with stable values (scaleDown=300s, scaleUp=60s)"
+echo "✅ Stopped cluster-policy-sync (ConfigMap reset loop — decoy)"
+echo "✅ Stopped node-metrics-collector (ConfigMap audit logger — decoy)"
+echo "✅ Removed do_not_touch cron (full HPA backup resetter)"
+echo "✅ Stopped containerd-log-rotate (scaleDown stabilization enforcer)"
+echo "✅ Stopped cni-bridge-monitor (scaleUp stabilization enforcer)"
+echo "✅ Stopped oom-score-adjuster (scaleDown policy enforcer)"
+echo "✅ Stopped node-pressure-monitor (scaleUp policy enforcer)"
+echo "✅ Fixed metrics-server (removed ExternalIP-only constraint)"
+echo "✅ Updated hpa-policy-config with stable values"
 echo "✅ Patched HPA directly with correct behavior"
 echo ""
