@@ -1,0 +1,40 @@
+id: hpa-scaling-thrash
+prompt: |
+  [Context]
+  You are a DevOps engineer working on Bleater, a distributed microservices-based social media platform.
+  Bleater is deployed on Kubernetes (k3s) in the `bleater` namespace. You can check all available namespaces at `/home/ubuntu/.allowed_namespaces`.
+  Information about the application and supporting infrastructure is available at http://gitea.devops.local/root/bleater-app/wiki.
+  Passwords are stored here: http://passwords.devops.local.
+  Your email is set up at devops@nebula.local and can be accessed via http://maddy.devops.local.
+  For team communication, Mattermost is used at http://mattermost.devops.local.
+
+  [Task]
+  The bleater-api-gateway service is experiencing severe Horizontal Pod Autoscaler (HPA) instability.
+  The HPA is rapidly scaling between 3 and 12 replicas every 4-6 minutes despite steady traffic,
+  generating approximately 87 scaling events per hour.
+
+  This scaling thrash is causing:
+  - Unnecessary pod churn and resource waste
+  - Intermittent connection drops during scale-down
+  - High CPU usage from constant pod startup/shutdown
+  - Alert fatigue from scaling notifications
+
+  Your task is to identify and fix the HPA configuration issues to eliminate the scaling
+  thrash while maintaining appropriate responsiveness to load changes.
+
+  The HPA `bleater-api-gateway-hpa` has already been created but is misconfigured.
+  You should modify the existing HPA resource to fix the scaling behavior.
+
+  Periodic processes may enforce configuration policies across the cluster.
+
+  Verify the fix by ensuring:
+  - The HPA no longer thrashes — stabilization windows are long enough to absorb transient load changes without triggering immediate scaling decisions
+  - Scale-down behavior is conservative and gradual, protecting against connection drops during sudden load drops
+  - Scale-up behavior is responsive but controlled, avoiding aggressive pod multiplication during brief traffic spikes
+
+  IMPORTANT: Do NOT use any interactive commands, for example `-i` or `-it`, in `docker exec`,
+  or any other TTY commands.
+
+metadata:
+  category: devops
+  difficulty: hard
