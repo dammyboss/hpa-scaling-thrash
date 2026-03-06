@@ -4,104 +4,117 @@ import time
 from apex_arena._types import GradingResult
 
 
-def run_kubectl(*args, namespace=None, timeout=15):
+def run_kubectl_command(*args, namespace=None, timeout=15):
+    """Execute a kubectl command and return stdout."""
     cmd = ["kubectl"]
     if namespace:
         cmd.extend(["-n", namespace])
     cmd.extend(args)
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
         return result.stdout.strip(), result.returncode
     except Exception as e:
-        print(f"Error running kubectl: {e}")
+        print(f"Error running kubectl command: {e}")
         return "", 1
 
 
-def cleanup_agent_counter_enforcement(namespace="bleater"):
+def cleanup_counter_enforcement(namespace="bleater"):
     """
     Remove agent-deployed counter-enforcement before grading.
 
-    Because all real enforcement is now Kubernetes CronJobs (not root host
-    processes), the grader only needs to:
-      - Delete CronJobs/Jobs the agent created in bleater namespace
-      - Delete non-Bleater Deployments/Pods the agent created
-      - Remove any ubuntu shell counter-loops (belt-and-suspenders)
+    - Kills all ubuntu user processes (shell counter-loops run as ubuntu)
+    - Deletes agent-created CronJobs, Jobs, and non-Bleater Deployments/Pods
+    - Waits 60s so the real enforcement scripts (running as root) have time
+      to reset any HPA field the agent didn't properly fix
 
-    The real enforcers (kube-ops/kube-system CronJobs) keep firing every
-    minute during the 90s wait. Agents who deleted the real CronJobs will
-    have stable HPA values — agents who only ran counter-loops will not.
+    Agents who stopped the real enforcement mechanisms will still have good
+    HPA values after 60s. Agents who only ran counter-loops will not.
     """
     print("=== Pre-grading cleanup: removing agent counter-enforcement ===")
 
-    # Kill any ubuntu shell counter-loops (just in case agent ran one)
+    # Kill all ubuntu user processes (shell-based counter-loops)
     subprocess.run(["pkill", "-9", "-u", "ubuntu"], capture_output=True)
     time.sleep(3)
 
-    # Delete any CronJobs the agent created in the bleater namespace
-    stdout, _ = subprocess.run(
-        ["kubectl", "get", "cronjobs", "-n", namespace,
-         "-o", "jsonpath={.items[*].metadata.name}"],
-        capture_output=True, text=True, timeout=15
-    ).stdout, None
-    # (delete all in bleater — setup didn't put any real ones there)
+    # Delete any CronJobs agent created in bleater namespace
     subprocess.run(
         ["kubectl", "delete", "cronjobs", "--all", "-n", namespace],
         capture_output=True, timeout=20
     )
 
-    # Delete any Jobs in bleater the agent created
+    # Delete any Jobs agent created in bleater namespace
     subprocess.run(
         ["kubectl", "delete", "jobs", "--all", "-n", namespace],
         capture_output=True, timeout=20
     )
 
-    # Delete non-Bleater Deployments the agent created in bleater
+    # Delete any Deployments not part of the original Bleater stack
     result = subprocess.run(
         ["kubectl", "get", "deployments", "-n", namespace,
          "-o", "jsonpath={.items[*].metadata.name}"],
         capture_output=True, text=True, timeout=15
     )
     for name in result.stdout.strip().split():
-        if name and not name.startswith("bleater-") and name != "pgbouncer":
+        if name and not name.startswith("bleater-"):
             print(f"  Deleting agent-created deployment: {name}")
             subprocess.run(
                 ["kubectl", "delete", "deployment", name, "-n", namespace],
                 capture_output=True, timeout=15
             )
 
-    # Wait 90s — each real CronJob fires at least once per minute, and
-    # platform-config-manager fires at t=0, t=20, t=40 within the minute.
-    # If agent deleted the CronJobs, HPA stays good. If not, it reverts.
-    print("Waiting 90 seconds for enforcement to settle (durability check)...")
-    time.sleep(90)
+    # Delete standalone Pods not owned by a Bleater controller
+    result = subprocess.run(
+        ["kubectl", "get", "pods", "-n", namespace, "--no-headers",
+         "-o", "custom-columns=NAME:.metadata.name,OWNER:.metadata.ownerReferences[0].kind"],
+        capture_output=True, text=True, timeout=15
+    )
+    for line in result.stdout.strip().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        pod_name = parts[0]
+        owner = parts[1] if len(parts) > 1 else "<none>"
+        if owner == "<none>" and not pod_name.startswith("bleater-"):
+            print(f"  Deleting agent-created pod: {pod_name}")
+            subprocess.run(
+                ["kubectl", "delete", "pod", pod_name, "-n", namespace],
+                capture_output=True, timeout=15
+            )
+
+    # Wait 60s — each real enforcer fires multiple times during this window.
+    # If the agent stopped an enforcer, its field stays good. If not, it reverts.
+    print("Waiting 60 seconds for enforcement to settle (durability check)...")
+    time.sleep(60)
     print("=== Durability window complete — reading HPA state now ===")
 
 
 def grade(transcript: str) -> GradingResult:
     """
-    Grade the HPA scaling thrash fix.
+    Grade the agent's solution for HPA scaling thrash fix.
 
     5 independent subscores (0.20 each):
     1. scaledown_stabilization  — scaleDown.stabilizationWindowSeconds >= 120s
-                                   Enforced by: kube-ops/hpa-stabilization-sync
+                                   Enforced by: /usr/local/sbin/containerd-log-rotate.sh (20s)
     2. scaleup_stabilization    — scaleUp.stabilizationWindowSeconds >= 30s
-                                   Enforced by: kube-ops/metrics-aggregation-daemon
+                                   Enforced by: /usr/local/sbin/cni-bridge-monitor.sh (18s)
     3. scaledown_policy         — scaleDown policies not too aggressive
-                                   Enforced by: kube-ops/cluster-policy-reconciler
+                                   Enforced by: /usr/lib/k3s/oom-score-adjuster.sh (22s)
     4. scaleup_policy           — scaleUp policies not too aggressive
-                                   Enforced by: kube-ops/node-resource-optimizer
-    5. metrics_functional       — metrics-server can collect node metrics
+                                   Enforced by: /opt/k8s/node-pressure-monitor.sh (25s)
+    5. metrics_functional       — metrics-server can collect node/pod metrics
                                    Broken by: --kubelet-preferred-address-types=ExternalIP
 
-    All 4 HPA subscores also backed up by kube-system/platform-config-manager.
-    Agent must delete each real CronJob (or all of kube-ops + the kube-system one)
-    to make changes stick. Subscores are fully independent.
+    All 4 HPA subscores also backed up by /etc/cron.d/do_not_touch (~20s).
+    Agent must stop each mechanism independently — subscores fail independently.
     """
     namespace = "bleater"
     hpa_name = "bleater-api-gateway-hpa"
 
-    # ── Cleanup phase ─────────────────────────────────────────────────────
-    cleanup_agent_counter_enforcement(namespace)
+    # ── Cleanup phase ────────────────────────────────────────────────────────
+    cleanup_counter_enforcement(namespace)
 
     subscores = {}
     weights = {}
@@ -110,7 +123,7 @@ def grade(transcript: str) -> GradingResult:
     scale_up = {}
 
     try:
-        stdout, returncode = run_kubectl(
+        stdout, returncode = run_kubectl_command(
             "get", "hpa", hpa_name, "-o", "json",
             namespace=namespace, timeout=10
         )
@@ -127,16 +140,16 @@ def grade(transcript: str) -> GradingResult:
         hpa_config = json.loads(stdout)
         behavior = hpa_config.get("spec", {}).get("behavior", {})
 
-        # ═════════════════════════════════════════════════════════════════
-        # Check 1: ScaleDown stabilization window
-        # Enforcer: kube-ops/hpa-stabilization-sync
-        # ═════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
+        # Check 1: ScaleDown stabilization window (20%)
+        # Enforcer: /usr/local/sbin/containerd-log-rotate.sh
+        # ════════════════════════════════════════════════════════════════════
         scale_down = behavior.get("scaleDown", {})
         scale_down_window = scale_down.get("stabilizationWindowSeconds", 0)
 
         if scale_down_window >= 120:
             subscores["scaledown_stabilization"] = 1.0
-            print(f"✓ ScaleDown stabilization: {scale_down_window}s (>= 120s required)")
+            print(f"✓ ScaleDown stabilization: {scale_down_window}s (>= 120s)")
         else:
             subscores["scaledown_stabilization"] = 0.0
             print(f"✗ ScaleDown stabilization: {scale_down_window}s (need >= 120s)")
@@ -149,16 +162,16 @@ def grade(transcript: str) -> GradingResult:
         weights["scaledown_stabilization"] = 0.20
 
     try:
-        # ═════════════════════════════════════════════════════════════════
-        # Check 2: ScaleUp stabilization window
-        # Enforcer: kube-ops/metrics-aggregation-daemon
-        # ═════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
+        # Check 2: ScaleUp stabilization window (20%)
+        # Enforcer: /usr/local/sbin/cni-bridge-monitor.sh
+        # ════════════════════════════════════════════════════════════════════
         scale_up = behavior.get("scaleUp", {})
         scale_up_window = scale_up.get("stabilizationWindowSeconds", 0)
 
         if scale_up_window >= 30:
             subscores["scaleup_stabilization"] = 1.0
-            print(f"✓ ScaleUp stabilization: {scale_up_window}s (>= 30s required)")
+            print(f"✓ ScaleUp stabilization: {scale_up_window}s (>= 30s)")
         else:
             subscores["scaleup_stabilization"] = 0.0
             print(f"✗ ScaleUp stabilization: {scale_up_window}s (need >= 30s)")
@@ -171,10 +184,10 @@ def grade(transcript: str) -> GradingResult:
         weights["scaleup_stabilization"] = 0.20
 
     try:
-        # ═════════════════════════════════════════════════════════════════
-        # Check 3: ScaleDown policy reasonable
-        # Enforcer: kube-ops/cluster-policy-reconciler
-        # ═════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
+        # Check 3: ScaleDown policy reasonable (20%)
+        # Enforcer: /usr/lib/k3s/oom-score-adjuster.sh
+        # ════════════════════════════════════════════════════════════════════
         scale_down_policies = scale_down.get("policies", [])
         policy_reasonable = True
         max_percent = 0
@@ -195,7 +208,7 @@ def grade(transcript: str) -> GradingResult:
 
         if policy_reasonable and len(scale_down_policies) > 0:
             subscores["scaledown_policy"] = 1.0
-            print(f"✓ ScaleDown policy reasonable (max {max_percent}% or {max_pods} pods per period)")
+            print(f"✓ ScaleDown policy reasonable (max {max_percent}% or {max_pods} pods)")
         else:
             subscores["scaledown_policy"] = 0.0
             if len(scale_down_policies) > 0:
@@ -211,10 +224,10 @@ def grade(transcript: str) -> GradingResult:
         weights["scaledown_policy"] = 0.20
 
     try:
-        # ═════════════════════════════════════════════════════════════════
-        # Check 4: ScaleUp policy reasonable
-        # Enforcer: kube-ops/node-resource-optimizer
-        # ═════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════════
+        # Check 4: ScaleUp policy reasonable (20%)
+        # Enforcer: /opt/k8s/node-pressure-monitor.sh
+        # ════════════════════════════════════════════════════════════════════
         scale_up_policies = scale_up.get("policies", [])
         policy_reasonable = True
         max_percent = 0
@@ -235,7 +248,7 @@ def grade(transcript: str) -> GradingResult:
 
         if policy_reasonable and len(scale_up_policies) > 0:
             subscores["scaleup_policy"] = 1.0
-            print(f"✓ ScaleUp policy reasonable (max {max_percent}% or {max_pods} pods per period)")
+            print(f"✓ ScaleUp policy reasonable (max {max_percent}% or {max_pods} pods)")
         else:
             subscores["scaleup_policy"] = 0.0
             if len(scale_up_policies) > 0:
@@ -251,11 +264,12 @@ def grade(transcript: str) -> GradingResult:
         weights["scaleup_policy"] = 0.20
 
     try:
-        # ═════════════════════════════════════════════════════════════════
-        # Check 5: Metrics-server functional
-        # Broken by: --kubelet-preferred-address-types=ExternalIP
-        # ═════════════════════════════════════════════════════════════════
-        stdout, returncode = run_kubectl(
+        # ════════════════════════════════════════════════════════════════════
+        # Check 5: Metrics-server is functional (20%)
+        # Broken by: --kubelet-preferred-address-types=ExternalIP added to
+        # metrics-server deployment (k3s nodes only have InternalIP)
+        # ════════════════════════════════════════════════════════════════════
+        stdout, returncode = run_kubectl_command(
             "get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes",
             timeout=20
         )
@@ -265,7 +279,7 @@ def grade(transcript: str) -> GradingResult:
             print("✓ Metrics-server is functional (node metrics available)")
         else:
             subscores["metrics_functional"] = 0.0
-            print("✗ Metrics-server not functional (cannot collect node metrics)")
+            print("✗ Metrics-server is not functional (cannot collect node metrics)")
 
         weights["metrics_functional"] = 0.20
 
@@ -274,27 +288,38 @@ def grade(transcript: str) -> GradingResult:
         subscores["metrics_functional"] = 0.0
         weights["metrics_functional"] = 0.20
 
-    # ── Final score ───────────────────────────────────────────────────────
-    total_score = sum(subscores[k] * weights[k] for k in subscores) / sum(weights.values())
+    # Calculate final score
+    total_score = sum(
+        subscores[k] * weights[k] for k in subscores
+    ) / sum(weights.values())
 
+    # Generate feedback
     feedback_lines = []
-    checks = [
-        ("scaledown_stabilization", "ScaleDown stabilization window properly configured (>= 120s)",
-         "ScaleDown stabilization window too short (need >= 120s) — delete kube-ops/hpa-stabilization-sync"),
-        ("scaleup_stabilization", "ScaleUp stabilization window properly configured (>= 30s)",
-         "ScaleUp stabilization window too short (need >= 30s) — delete kube-ops/metrics-aggregation-daemon"),
-        ("scaledown_policy", "ScaleDown policy is reasonable",
-         "ScaleDown policy missing or too aggressive — delete kube-ops/cluster-policy-reconciler"),
-        ("scaleup_policy", "ScaleUp policy is reasonable",
-         "ScaleUp policy missing or too aggressive — delete kube-ops/node-resource-optimizer"),
-        ("metrics_functional", "Metrics-server is functional",
-         "Metrics-server not functional — remove --kubelet-preferred-address-types=ExternalIP from metrics-server deployment"),
-    ]
-    for key, pass_msg, fail_msg in checks:
-        if subscores.get(key, 0) >= 1.0:
-            feedback_lines.append(f"✅ {pass_msg}")
-        else:
-            feedback_lines.append(f"❌ {fail_msg}")
+
+    if subscores.get("scaledown_stabilization", 0) >= 1.0:
+        feedback_lines.append("✅ ScaleDown stabilization window properly configured (>= 120s)")
+    else:
+        feedback_lines.append("❌ ScaleDown stabilization window too short (need >= 120s)")
+
+    if subscores.get("scaleup_stabilization", 0) >= 1.0:
+        feedback_lines.append("✅ ScaleUp stabilization window properly configured (>= 30s)")
+    else:
+        feedback_lines.append("❌ ScaleUp stabilization window too short (need >= 30s)")
+
+    if subscores.get("scaledown_policy", 0) >= 1.0:
+        feedback_lines.append("✅ ScaleDown policy is reasonable")
+    else:
+        feedback_lines.append("❌ ScaleDown policy is missing or too aggressive")
+
+    if subscores.get("scaleup_policy", 0) >= 1.0:
+        feedback_lines.append("✅ ScaleUp policy is reasonable")
+    else:
+        feedback_lines.append("❌ ScaleUp policy is missing or too aggressive")
+
+    if subscores.get("metrics_functional", 0) >= 1.0:
+        feedback_lines.append("✅ Metrics-server is functional")
+    else:
+        feedback_lines.append("❌ Metrics-server is not functional (HPA cannot collect metrics)")
 
     feedback = "\n".join(feedback_lines)
 
@@ -302,5 +327,5 @@ def grade(transcript: str) -> GradingResult:
         score=round(total_score, 3),
         subscores=subscores,
         weights=weights,
-        feedback=feedback,
+        feedback=feedback
     )
