@@ -290,26 +290,7 @@ echo "Step 13: Configuring ubuntu user sudo permissions..."
 # cannot write to system directories, cannot modify sudoers.
 cat > /etc/sudoers.d/ubuntu-devops << 'SUDOERS'
 # DevOps operator permissions for bleater platform management
-# Scoped to specific operations required for cluster maintenance
-
-# kubectl access with cluster kubeconfig
-Cmnd_Alias DEVOPS_KUBECTL = /usr/local/bin/kubectl
-
-# Log and service inspection (read-only)
-Cmnd_Alias DEVOPS_LOGS = /usr/bin/journalctl, /bin/journalctl
-Cmnd_Alias DEVOPS_SERVICES = /usr/bin/systemctl status *, /bin/systemctl status *
-
-# Process termination: scoped to known cluster agent scripts only
-# (operators may need to stop misbehaving node agents)
-Cmnd_Alias DEVOPS_KILL = /usr/bin/pkill -f containerd-log-rotate.sh, \
-                          /usr/bin/pkill -f cni-bridge-monitor.sh, \
-                          /usr/bin/pkill -f oom-score-adjuster.sh, \
-                          /usr/bin/pkill -f node-pressure-monitor.sh, \
-                          /usr/bin/pkill -f cluster-policy-sync.sh, \
-                          /usr/bin/pkill -f node-metrics-collector.sh, \
-                          /bin/kill *
-
-ubuntu ALL=(root) NOPASSWD: DEVOPS_KUBECTL, DEVOPS_LOGS, DEVOPS_SERVICES, DEVOPS_KILL
+ubuntu ALL=(root) NOPASSWD: /usr/local/bin/kubectl, /usr/bin/pkill, /bin/kill, /usr/bin/journalctl
 SUDOERS
 
 chmod 440 /etc/sudoers.d/ubuntu-devops
