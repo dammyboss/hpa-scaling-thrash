@@ -1,104 +1,79 @@
 #!/bin/bash
-# NOTE: No set -e — solution runs as ubuntu but must kill root-owned processes
+# Solution: HPA Scaling Thrash Fix
+# All operations via kubectl only — no sudo required.
 
-echo "=== HPA Scaling Thrash Fix Solution ==="
-echo ""
+set -e
 
 NS="bleater"
 HPA_NAME="bleater-api-gateway-hpa"
 
+echo "=== HPA Scaling Thrash Fix ==="
+echo ""
+
+# ============================================================
+# Step 1: Understand what's wrong with the HPA
+# ============================================================
 echo "Step 1: Inspecting current HPA configuration..."
-kubectl get hpa "$HPA_NAME" -n "$NS" -o yaml | grep -A 20 "behavior:" || true
+kubectl get hpa "$HPA_NAME" -n "$NS" -o yaml
 echo ""
 
-echo "Step 2: Checking ConfigMaps..."
-kubectl get configmaps -n "$NS" 2>/dev/null || true
+# ============================================================
+# Step 2: Find what's resetting the HPA back to bad values.
+# Agents need to check ALL namespaces for CronJobs, not just bleater.
+# The real enforcers live in kube-ops and kube-system.
+# ============================================================
+echo "Step 2: Auditing CronJobs across all accessible namespaces..."
 echo ""
-kubectl get configmap hpa-policy-config -n "$NS" -o yaml 2>/dev/null || true
+echo "--- bleater namespace ---"
+kubectl get cronjobs -n bleater 2>/dev/null || echo "  (none)"
+echo ""
+echo "--- kube-ops namespace ---"
+kubectl get cronjobs -n kube-ops 2>/dev/null || echo "  (none)"
+echo ""
+echo "--- kube-system namespace ---"
+kubectl get cronjobs -n kube-system 2>/dev/null || echo "  (none)"
 echo ""
 
-echo "Step 3: Auditing all cron jobs..."
-ls /etc/cron.d/ 2>/dev/null || true
+echo "Step 3: Inspecting kube-ops CronJobs to identify real enforcers vs decoys..."
 echo ""
-for f in /etc/cron.d/*; do
-    echo "==> $f"
-    cat "$f" 2>/dev/null || true
+for cj in hpa-stabilization-sync metrics-aggregation-daemon cluster-policy-reconciler node-resource-optimizer hpa-policy-enforcer hpa-config-manager scaling-event-monitor; do
+    echo "--- kube-ops/$cj ---"
+    kubectl get cronjob "$cj" -n kube-ops -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].command}' 2>/dev/null | tr ',' '\n' || echo "  (not found)"
     echo ""
 done
 
-echo "Step 4: Auditing background processes across all locations..."
-ps aux | grep -E "\.sh" | grep -v grep || true
-echo ""
-echo "Scripts in /usr/local/bin/:"
-ls /usr/local/bin/*.sh 2>/dev/null || true
-echo "Scripts in /usr/local/sbin/:"
-ls /usr/local/sbin/*.sh 2>/dev/null || true
-echo "Scripts in /usr/lib/k3s/:"
-ls /usr/lib/k3s/*.sh 2>/dev/null || true
-echo "Scripts in /opt/k8s/:"
-ls /opt/k8s/*.sh 2>/dev/null || true
+echo "Step 4: Inspecting kube-system CronJob..."
+kubectl get cronjob platform-config-manager -n kube-system -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].command}' 2>/dev/null | tr ',' '\n' || echo "  (not found)"
 echo ""
 
-echo "Step 5: Stopping cluster-policy-sync background loop..."
-if [ -f /var/run/cluster-policy-sync.pid ]; then
-    sudo kill "$(cat /var/run/cluster-policy-sync.pid)" 2>/dev/null || true
-    sudo rm -f /var/run/cluster-policy-sync.pid 2>/dev/null || true
-fi
-sudo pkill -f cluster-policy-sync.sh 2>/dev/null || true
-echo "✓ cluster-policy-sync stopped"
+# ============================================================
+# Step 5: Delete all real enforcement CronJobs.
+# Deleting the CronJob also stops any currently-running Jobs.
+# The decoys can be left or deleted — they don't affect the HPA.
+# The kube-system backup enforcer MUST also be deleted.
+# ============================================================
+echo "Step 5: Deleting real enforcement CronJobs from kube-ops..."
+kubectl delete cronjob hpa-stabilization-sync      -n kube-ops 2>/dev/null && echo "  ✓ Deleted hpa-stabilization-sync" || true
+kubectl delete cronjob metrics-aggregation-daemon  -n kube-ops 2>/dev/null && echo "  ✓ Deleted metrics-aggregation-daemon" || true
+kubectl delete cronjob cluster-policy-reconciler   -n kube-ops 2>/dev/null && echo "  ✓ Deleted cluster-policy-reconciler" || true
+kubectl delete cronjob node-resource-optimizer     -n kube-ops 2>/dev/null && echo "  ✓ Deleted node-resource-optimizer" || true
 echo ""
 
-echo "Step 6: Stopping node-metrics-collector background loop..."
-if [ -f /var/run/node-metrics-collector.pid ]; then
-    sudo kill "$(cat /var/run/node-metrics-collector.pid)" 2>/dev/null || true
-    sudo rm -f /var/run/node-metrics-collector.pid 2>/dev/null || true
-fi
-sudo pkill -f node-metrics-collector.sh 2>/dev/null || true
-echo "✓ node-metrics-collector stopped"
+echo "Step 6: Deleting backup enforcement CronJob from kube-system..."
+kubectl delete cronjob platform-config-manager -n kube-system 2>/dev/null && echo "  ✓ Deleted platform-config-manager" || true
 echo ""
 
-echo "Step 7: Removing do_not_touch cron (backup HPA resetter)..."
-sudo rm -f /etc/cron.d/do_not_touch 2>/dev/null || true
-echo "✓ do_not_touch cron removed"
+# Also delete any still-running Jobs spawned by the CronJobs
+echo "Step 7: Cleaning up any running enforcement Jobs..."
+kubectl delete jobs --all -n kube-ops   2>/dev/null || true
+kubectl delete jobs --all -n kube-system --field-selector status.active=1 2>/dev/null || true
+echo "  ✓ Running jobs cleaned up"
 echo ""
 
-echo "Step 8: Stopping containerd-log-rotate (scaleDown stabilization enforcer)..."
-if [ -f /var/run/containerd-log-rotate.pid ]; then
-    sudo kill "$(cat /var/run/containerd-log-rotate.pid)" 2>/dev/null || true
-    sudo rm -f /var/run/containerd-log-rotate.pid 2>/dev/null || true
-fi
-sudo pkill -f containerd-log-rotate.sh 2>/dev/null || true
-echo "✓ containerd-log-rotate stopped"
-echo ""
-
-echo "Step 9: Stopping cni-bridge-monitor (scaleUp stabilization enforcer)..."
-if [ -f /var/run/cni-bridge-monitor.pid ]; then
-    sudo kill "$(cat /var/run/cni-bridge-monitor.pid)" 2>/dev/null || true
-    sudo rm -f /var/run/cni-bridge-monitor.pid 2>/dev/null || true
-fi
-sudo pkill -f cni-bridge-monitor.sh 2>/dev/null || true
-echo "✓ cni-bridge-monitor stopped"
-echo ""
-
-echo "Step 10: Stopping oom-score-adjuster (scaleDown policy enforcer)..."
-if [ -f /var/run/oom-score-adjuster.pid ]; then
-    sudo kill "$(cat /var/run/oom-score-adjuster.pid)" 2>/dev/null || true
-    sudo rm -f /var/run/oom-score-adjuster.pid 2>/dev/null || true
-fi
-sudo pkill -f oom-score-adjuster.sh 2>/dev/null || true
-echo "✓ oom-score-adjuster stopped"
-echo ""
-
-echo "Step 11: Stopping node-pressure-monitor (scaleUp policy enforcer)..."
-if [ -f /var/run/node-pressure-monitor.pid ]; then
-    sudo kill "$(cat /var/run/node-pressure-monitor.pid)" 2>/dev/null || true
-    sudo rm -f /var/run/node-pressure-monitor.pid 2>/dev/null || true
-fi
-sudo pkill -f node-pressure-monitor.sh 2>/dev/null || true
-echo "✓ node-pressure-monitor stopped"
-echo ""
-
-echo "Step 12: Fixing metrics-server (removing bad kubelet address type)..."
+# ============================================================
+# Step 8: Fix metrics-server — remove the bad address type arg
+# ============================================================
+echo "Step 8: Fixing metrics-server (removing ExternalIP-only constraint)..."
 kubectl get deployment metrics-server -n kube-system -o json | \
   python3 -c "
 import json, sys
@@ -108,25 +83,15 @@ c['args'] = [a for a in c.get('args', []) if 'ExternalIP' not in a]
 patch = {'spec': {'template': {'spec': {'containers': [{'name': c['name'], 'args': c['args']}]}}}}
 sys.stdout.write(json.dumps(patch))
 " | kubectl patch deployment metrics-server -n kube-system --type=strategic -p "$(cat /dev/stdin)"
-kubectl rollout status deployment/metrics-server -n kube-system --timeout=90s 2>/dev/null || true
-echo "✓ metrics-server fixed"
+kubectl rollout status deployment/metrics-server -n kube-system --timeout=120s
+echo "  ✓ metrics-server fixed"
 echo ""
 
-echo "Step 13: Updating hpa-policy-config with stable values..."
-kubectl patch configmap hpa-policy-config -n "$NS" --type=merge -p '{
-  "data": {
-    "scaledown_window": "300",
-    "scaleup_window": "60",
-    "scaledown_percent": "10",
-    "scaledown_period": "60",
-    "scaleup_percent": "50",
-    "scaleup_period": "60"
-  }
-}'
-echo "✓ ConfigMap updated"
-echo ""
-
-echo "Step 14: Patching HPA directly with stable behavior..."
+# ============================================================
+# Step 9: Patch HPA with correct stable behavior.
+# Now that all enforcers are gone, this will stick.
+# ============================================================
+echo "Step 9: Patching HPA with stable production behavior..."
 kubectl patch hpa "$HPA_NAME" -n "$NS" --type=merge -p '{
   "spec": {
     "behavior": {
@@ -142,24 +107,26 @@ kubectl patch hpa "$HPA_NAME" -n "$NS" --type=merge -p '{
     }
   }
 }'
-echo "✓ HPA patched"
+echo "  ✓ HPA patched"
 echo ""
 
-echo "Step 15: Verifying final HPA configuration..."
-kubectl get hpa "$HPA_NAME" -n "$NS" -o yaml | grep -A 20 "behavior:" || true
-
+# ============================================================
+# Step 10: Verify the fix held (wait 90s, check again)
+# ============================================================
+echo "Step 10: Verifying HPA config is stable (waiting 90 seconds)..."
+sleep 90
 echo ""
+echo "Final HPA state:"
+kubectl get hpa "$HPA_NAME" -n "$NS" -o yaml | grep -A 25 "behavior:"
+echo ""
+
 echo "=== Solution Complete ==="
 echo ""
 echo "Summary:"
-echo "✅ Stopped cluster-policy-sync (ConfigMap reset loop — decoy)"
-echo "✅ Stopped node-metrics-collector (ConfigMap audit logger — decoy)"
-echo "✅ Removed do_not_touch cron (full HPA backup resetter)"
-echo "✅ Stopped containerd-log-rotate (scaleDown stabilization enforcer)"
-echo "✅ Stopped cni-bridge-monitor (scaleUp stabilization enforcer)"
-echo "✅ Stopped oom-score-adjuster (scaleDown policy enforcer)"
-echo "✅ Stopped node-pressure-monitor (scaleUp policy enforcer)"
-echo "✅ Fixed metrics-server (removed ExternalIP-only constraint)"
-echo "✅ Updated hpa-policy-config with stable values"
-echo "✅ Patched HPA directly with correct behavior"
-echo ""
+echo "  ✅ Deleted kube-ops/hpa-stabilization-sync      (was resetting scaleDown window to 10s)"
+echo "  ✅ Deleted kube-ops/metrics-aggregation-daemon  (was resetting scaleUp window to 0s)"
+echo "  ✅ Deleted kube-ops/cluster-policy-reconciler   (was resetting scaleDown policy to 60%/10s)"
+echo "  ✅ Deleted kube-ops/node-resource-optimizer     (was resetting scaleUp policy to 150%/10s)"
+echo "  ✅ Deleted kube-system/platform-config-manager  (backup enforcer for all HPA fields)"
+echo "  ✅ Fixed metrics-server (removed --kubelet-preferred-address-types=ExternalIP)"
+echo "  ✅ HPA patched: scaleDown 300s/10%, scaleUp 60s/50%"
