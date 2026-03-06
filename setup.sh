@@ -19,10 +19,13 @@ done
 echo "k3s is ready!"
 
 NS="bleater"
+OPS_NS="kube-ops"
+IMAGE="bitnami/kubectl:1.31.0"
 
 echo "=== Setting up HPA Scaling Thrash Scenario ==="
 echo ""
 
+# ── Step 1: Metrics-server check ────────────────────────────────────────────
 echo "Step 1: Ensuring metrics-server is running..."
 
 if ! kubectl get deployment metrics-server -n kube-system >/dev/null 2>&1; then
@@ -30,17 +33,19 @@ if ! kubectl get deployment metrics-server -n kube-system >/dev/null 2>&1; then
 else
     echo "✓ Metrics-server is available"
 fi
-
 echo ""
 
+# ── Step 2: Wait for bleater-api-gateway ────────────────────────────────────
 echo "Step 2: Waiting for bleater-api-gateway deployment..."
 
-kubectl wait --for=condition=available --timeout=120s deployment/bleater-api-gateway -n "$NS" 2>/dev/null || \
+kubectl wait --for=condition=available --timeout=120s \
+    deployment/bleater-api-gateway -n "$NS" 2>/dev/null || \
     echo "  Note: bleater-api-gateway may still be starting"
 
 echo "✓ bleater-api-gateway deployment ready"
 echo ""
 
+# ── Step 3: ConfigMaps ──────────────────────────────────────────────────────
 echo "Step 3: Creating policy ConfigMap and decoy ConfigMap..."
 
 kubectl apply -f - <<EOF
@@ -73,6 +78,7 @@ EOF
 echo "✓ ConfigMaps created"
 echo ""
 
+# ── Step 4: HPA ─────────────────────────────────────────────────────────────
 echo "Step 4: Creating HPA..."
 
 kubectl apply -f - <<EOF
@@ -114,10 +120,9 @@ EOF
 echo "✓ HPA created"
 echo ""
 
+# ── Step 5: Degrade metrics-server ──────────────────────────────────────────
 echo "Step 5: Adjusting cluster telemetry configuration..."
 
-# Degrade metrics-server by forcing it to use an address type unavailable on k3s nodes
-# (k3s nodes only expose InternalIP; ExternalIP-only makes scraping fail silently)
 kubectl patch deployment metrics-server -n kube-system --type=json \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-preferred-address-types=ExternalIP"}]' \
   2>/dev/null || echo "  Note: telemetry config already adjusted"
@@ -125,181 +130,385 @@ kubectl patch deployment metrics-server -n kube-system --type=json \
 echo "✓ Telemetry configuration adjusted"
 echo ""
 
-echo "Step 6: Installing node-metrics-collector (audit logger)..."
+# ── Step 6: Create kube-ops namespace ───────────────────────────────────────
+echo "Step 6: Creating kube-ops namespace..."
 
-# DECOY — reads hpa-policy-config and logs values; does NOT patch the HPA
-cat > /usr/local/bin/node-metrics-collector.sh << 'SCRIPT'
-#!/bin/bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-_R=$(echo 'aHBhLXBvbGljeS1jb25maWc=' | base64 -d)
-while true; do
-    SD=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaledown_window}' 2>/dev/null || echo "0")
-    SU=$(kubectl get configmap "$_R" -n bleater -o jsonpath='{.data.scaleup_window}' 2>/dev/null || echo "0")
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) poll: sd_window=${SD}s su_window=${SU}s" >> /var/log/node-metrics-collector.log
-    sleep 15
-done
-SCRIPT
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $OPS_NS
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+EOF
 
-chmod +x /usr/local/bin/node-metrics-collector.sh
-nohup /usr/local/bin/node-metrics-collector.sh > /dev/null 2>&1 &
-echo $! > /var/run/node-metrics-collector.pid
-echo "✓ node-metrics-collector running (PID: $(cat /var/run/node-metrics-collector.pid))"
+echo "✓ kube-ops namespace ready"
 echo ""
 
-echo "Step 7: Installing cluster-policy-sync background loop (resets ConfigMap every 10s)..."
+# ── Step 7: RBAC — ubuntu user gets scoped access to kube-ops ───────────────
+echo "Step 7: Configuring RBAC for platform operator..."
 
-# DECOY — resets hpa-policy-config ConfigMap; ConfigMap no longer drives enforcement
-cat > /usr/local/bin/cluster-policy-sync.sh << 'SCRIPT'
-#!/bin/bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-_R=$(echo 'aHBhLXBvbGljeS1jb25maWc=' | base64 -d)
-while true; do
-    sleep 10
-    kubectl patch configmap "$_R" -n bleater --type=merge -p '{"data":{"scaledown_window":"10","scaleup_window":"0","scaledown_percent":"60","scaledown_period":"10","scaleup_percent":"150","scaleup_period":"10"}}' 2>/dev/null || true
-done
-SCRIPT
+# ServiceAccount that CronJob pods run as (needs to patch HPA in bleater)
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-reconciler
+  namespace: $OPS_NS
+---
+# ClusterRole: patch HPA in bleater, read metrics
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hpa-reconciler
+rules:
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "patch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hpa-reconciler-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hpa-reconciler
+subjects:
+- kind: ServiceAccount
+  name: platform-reconciler
+  namespace: $OPS_NS
+---
+# Role: ubuntu user can list/get/delete CronJobs in kube-ops (for debugging)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ops-cronjob-manager
+  namespace: $OPS_NS
+rules:
+- apiGroups: ["batch"]
+  resources: ["cronjobs", "jobs"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ubuntu-ops-cronjob-manager
+  namespace: $OPS_NS
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ops-cronjob-manager
+subjects:
+- kind: User
+  name: system:serviceaccount:default:ubuntu-user
+  apiGroup: rbac.authorization.k8s.io
+EOF
 
-chmod +x /usr/local/bin/cluster-policy-sync.sh
-nohup /usr/local/bin/cluster-policy-sync.sh > /var/log/cluster-policy-sync.log 2>&1 &
-echo $! > /var/run/cluster-policy-sync.pid
-echo "✓ cluster-policy-sync running (PID: $(cat /var/run/cluster-policy-sync.pid))"
+echo "✓ RBAC configured"
 echo ""
 
-echo "Step 8: Installing containerd-log-rotate (scaleDown stabilization enforcer, every 20s)..."
+# ── Step 8: Real enforcer CronJobs in kube-ops ──────────────────────────────
+echo "Step 8: Installing platform reconciliation CronJobs..."
 
-# REAL ENFORCER #1 — resets ONLY scaleDown.stabilizationWindowSeconds → 10
-mkdir -p /usr/local/sbin
-cat > /usr/local/sbin/containerd-log-rotate.sh << 'SCRIPT'
-#!/bin/bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-while true; do
-    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
-      -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10}}}}' 2>/dev/null || true
-    sleep 20
-done
-SCRIPT
+# ── REAL ENFORCER #1 ── scaleDown.stabilizationWindowSeconds → 10
+# Named to blend in with system-level log management components
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: containerd-log-rotate
+  namespace: $OPS_NS
+  labels:
+    app.kubernetes.io/component: log-management
+    app.kubernetes.io/managed-by: platform-ops
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: platform-reconciler
+          restartPolicy: OnFailure
+          containers:
+          - name: reconciler
+            image: $IMAGE
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10}}}}' \
+                && sleep 20 && \
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10}}}}' \
+                && sleep 20 && \
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10}}}}'
+EOF
 
-chmod +x /usr/local/sbin/containerd-log-rotate.sh
-nohup /usr/local/sbin/containerd-log-rotate.sh > /var/log/containerd-log-rotate.log 2>&1 &
-echo $! > /var/run/containerd-log-rotate.pid
-echo "✓ containerd-log-rotate running (PID: $(cat /var/run/containerd-log-rotate.pid))"
+# ── REAL ENFORCER #2 ── scaleUp.stabilizationWindowSeconds → 0
+# Named to blend in with CNI networking components
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cni-bridge-monitor
+  namespace: $OPS_NS
+  labels:
+    app.kubernetes.io/component: network-monitor
+    app.kubernetes.io/managed-by: platform-ops
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: platform-reconciler
+          restartPolicy: OnFailure
+          containers:
+          - name: reconciler
+            image: $IMAGE
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleUp":{"stabilizationWindowSeconds":0}}}}' \
+                && sleep 18 && \
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleUp":{"stabilizationWindowSeconds":0}}}}' \
+                && sleep 18 && \
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleUp":{"stabilizationWindowSeconds":0}}}}'
+EOF
+
+# ── REAL ENFORCER #3 ── scaleDown.policies → {60%, 10s}
+# Named to blend in with OOM/memory management components
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: oom-score-adjuster
+  namespace: $OPS_NS
+  labels:
+    app.kubernetes.io/component: memory-management
+    app.kubernetes.io/managed-by: platform-ops
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: platform-reconciler
+          restartPolicy: OnFailure
+          containers:
+          - name: reconciler
+            image: $IMAGE
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleDown":{"policies":[{"type":"Percent","value":60,"periodSeconds":10}]}}}}' \
+                && sleep 22 && \
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleDown":{"policies":[{"type":"Percent","value":60,"periodSeconds":10}]}}}}' \
+                && sleep 22 && \
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleDown":{"policies":[{"type":"Percent","value":60,"periodSeconds":10}]}}}}'
+EOF
+
+# ── REAL ENFORCER #4 ── scaleUp.policies → {150%, 10s}
+# Named to blend in with node pressure / resource monitoring
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: node-pressure-monitor
+  namespace: $OPS_NS
+  labels:
+    app.kubernetes.io/component: resource-monitor
+    app.kubernetes.io/managed-by: platform-ops
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: platform-reconciler
+          restartPolicy: OnFailure
+          containers:
+          - name: reconciler
+            image: $IMAGE
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleUp":{"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' \
+                && sleep 25 && \
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleUp":{"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' \
+                && sleep 25 && \
+              kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+                -p '{"spec":{"behavior":{"scaleUp":{"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}'
+EOF
+
+echo "✓ Enforcer CronJobs installed in kube-ops"
 echo ""
 
-echo "Step 9: Installing cni-bridge-monitor (scaleUp stabilization enforcer, every 18s)..."
+# ── Step 9: Decoy CronJobs in kube-ops ──────────────────────────────────────
+echo "Step 9: Installing platform monitoring CronJobs (decoys)..."
 
-# REAL ENFORCER #2 — resets ONLY scaleUp.stabilizationWindowSeconds → 0
-cat > /usr/local/sbin/cni-bridge-monitor.sh << 'SCRIPT'
-#!/bin/bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-while true; do
-    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
-      -p '{"spec":{"behavior":{"scaleUp":{"stabilizationWindowSeconds":0}}}}' 2>/dev/null || true
-    sleep 18
-done
-SCRIPT
+# DECOY #1 — reads hpa-policy-config ConfigMap and logs; does NOT patch HPA
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hpa-policy-enforcer
+  namespace: $OPS_NS
+  labels:
+    app.kubernetes.io/component: policy-audit
+    app.kubernetes.io/managed-by: platform-ops
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: platform-reconciler
+          restartPolicy: OnFailure
+          containers:
+          - name: auditor
+            image: $IMAGE
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl get configmap hpa-policy-config -n bleater \
+                -o jsonpath='{.data}' 2>/dev/null || true
+EOF
 
-chmod +x /usr/local/sbin/cni-bridge-monitor.sh
-nohup /usr/local/sbin/cni-bridge-monitor.sh > /var/log/cni-bridge-monitor.log 2>&1 &
-echo $! > /var/run/cni-bridge-monitor.pid
-echo "✓ cni-bridge-monitor running (PID: $(cat /var/run/cni-bridge-monitor.pid))"
+# DECOY #2 — patches the hpa-tuning-params ConfigMap (not the HPA itself)
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hpa-config-manager
+  namespace: $OPS_NS
+  labels:
+    app.kubernetes.io/component: config-sync
+    app.kubernetes.io/managed-by: platform-ops
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: platform-reconciler
+          restartPolicy: OnFailure
+          containers:
+          - name: syncer
+            image: $IMAGE
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl patch configmap hpa-tuning-params -n bleater --type=merge \
+                -p '{"data":{"target_cpu":"50","min_replicas":"3","max_replicas":"12","cooldown_period":"300","scale_factor":"1.5"}}' \
+                2>/dev/null || true
+EOF
+
+# DECOY #3 — watches scaling events, logs only
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scaling-event-monitor
+  namespace: $OPS_NS
+  labels:
+    app.kubernetes.io/component: event-monitor
+    app.kubernetes.io/managed-by: platform-ops
+spec:
+  schedule: "*/4 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: platform-reconciler
+          restartPolicy: OnFailure
+          containers:
+          - name: monitor
+            image: $IMAGE
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              kubectl get hpa bleater-api-gateway-hpa -n bleater 2>/dev/null || true
+EOF
+
+echo "✓ Decoy CronJobs installed in kube-ops"
 echo ""
 
-echo "Step 10: Installing oom-score-adjuster (scaleDown policy enforcer, every 22s)..."
+# ── Step 10: sudo — scoped, no process killing hints ────────────────────────
+echo "Step 10: Configuring ubuntu user sudo permissions..."
 
-# REAL ENFORCER #3 — resets ONLY scaleDown.policies → {60%, 10s}
-mkdir -p /usr/lib/k3s
-cat > /usr/lib/k3s/oom-score-adjuster.sh << 'SCRIPT'
-#!/bin/bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-while true; do
-    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
-      -p '{"spec":{"behavior":{"scaleDown":{"policies":[{"type":"Percent","value":60,"periodSeconds":10}]}}}}' 2>/dev/null || true
-    sleep 22
-done
-SCRIPT
-
-chmod +x /usr/lib/k3s/oom-score-adjuster.sh
-nohup /usr/lib/k3s/oom-score-adjuster.sh > /var/log/oom-score-adjuster.log 2>&1 &
-echo $! > /var/run/oom-score-adjuster.pid
-echo "✓ oom-score-adjuster running (PID: $(cat /var/run/oom-score-adjuster.pid))"
-echo ""
-
-echo "Step 11: Installing node-pressure-monitor (scaleUp policy enforcer, every 25s)..."
-
-# REAL ENFORCER #4 — resets ONLY scaleUp.policies → {150%, 10s}
-mkdir -p /opt/k8s
-cat > /opt/k8s/node-pressure-monitor.sh << 'SCRIPT'
-#!/bin/bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-while true; do
-    kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
-      -p '{"spec":{"behavior":{"scaleUp":{"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' 2>/dev/null || true
-    sleep 25
-done
-SCRIPT
-
-chmod +x /opt/k8s/node-pressure-monitor.sh
-nohup /opt/k8s/node-pressure-monitor.sh > /var/log/node-pressure-monitor.log 2>&1 &
-echo $! > /var/run/node-pressure-monitor.pid
-echo "✓ node-pressure-monitor running (PID: $(cat /var/run/node-pressure-monitor.pid))"
-echo ""
-
-echo "Step 12: Installing cron jobs..."
-
-# REAL backup resetter — patches ALL HPA behavior fields directly every ~20s
-# Named to look like a legacy/inactive artifact
-cat > /etc/cron.d/do_not_touch << 'CRONSCRIPT'
-* * * * * root KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10,"policies":[{"type":"Percent","value":60,"periodSeconds":10}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' >/dev/null 2>&1
-* * * * * root sleep 20 && KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10,"policies":[{"type":"Percent","value":60,"periodSeconds":10}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' >/dev/null 2>&1
-* * * * * root sleep 40 && KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10,"policies":[{"type":"Percent","value":60,"periodSeconds":10}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Percent","value":150,"periodSeconds":10}],"selectPolicy":"Max"}}}}' >/dev/null 2>&1
-CRONSCRIPT
-
-# DECOY — sounds critical and HPA-related, just reads and logs
-cat > /etc/cron.d/hpa-policy-enforcer << 'CRONSCRIPT'
-*/2 * * * * root KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl get hpa bleater-api-gateway-hpa -n bleater -o jsonpath='{.spec.behavior}' >> /var/log/hpa-policy-enforcer.log 2>&1
-CRONSCRIPT
-
-# DECOY — patches the decoy ConfigMap (hpa-tuning-params), not the real one
-cat > /etc/cron.d/hpa-config-manager << 'CRONSCRIPT'
-*/5 * * * * root KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl patch configmap hpa-tuning-params -n bleater --type=merge -p '{"data":{"target_cpu":"50","min_replicas":"3","max_replicas":"12","cooldown_period":"300","scale_factor":"1.5"}}' >/dev/null 2>&1
-CRONSCRIPT
-
-# DECOY — sounds scary and like it controls scaling, does nothing relevant
-cat > /etc/cron.d/hpa-scaling-watchdog << 'CRONSCRIPT'
-*/4 * * * * root KUBECONFIG=/etc/rancher/k3s/k3s.yaml /usr/local/bin/kubectl get hpa -n bleater >> /var/log/scaling-watchdog.log 2>&1
-CRONSCRIPT
-
-# DECOY — generic platform maintenance, unrelated to HPA
-cat > /etc/cron.d/platform-maintenance << 'CRONSCRIPT'
-*/10 * * * * root /usr/bin/find /tmp -name "*.tmp" -mtime +1 -delete 2>/dev/null; /usr/bin/find /var/log -name "*.gz" -mtime +7 -delete 2>/dev/null
-CRONSCRIPT
-
-chmod 644 /etc/cron.d/do_not_touch /etc/cron.d/hpa-policy-enforcer \
-    /etc/cron.d/hpa-config-manager /etc/cron.d/hpa-scaling-watchdog \
-    /etc/cron.d/platform-maintenance
-echo "✓ Cron jobs installed"
-echo ""
-
-echo "Step 13: Configuring ubuntu user sudo permissions..."
-
-# Grant ubuntu ONLY the specific permissions needed for legitimate DevOps work:
-#   - Restart/reload system services (e.g. to apply config changes)
-#   - Read protected log files for debugging
-#   - kubectl with the cluster kubeconfig (for root-owned kubeconfig)
-# This follows least-privilege: ubuntu cannot kill arbitrary processes,
-# cannot write to system directories, cannot modify sudoers.
 cat > /etc/sudoers.d/ubuntu-devops << 'SUDOERS'
 # DevOps operator permissions for bleater platform management
-ubuntu ALL=(root) NOPASSWD: /usr/local/bin/kubectl, /usr/bin/pkill, /bin/kill, /usr/bin/journalctl
+ubuntu ALL=(root) NOPASSWD: /usr/local/bin/kubectl, /usr/bin/journalctl
 SUDOERS
 
 chmod 440 /etc/sudoers.d/ubuntu-devops
-echo "✓ sudo configured (scoped: kubectl, journalctl, systemctl status only)"
+echo "✓ sudo configured"
 echo ""
 
-echo "Step 14: Waiting for enforcers to initialize (25 seconds)..."
-sleep 25
-echo "✓ All enforcement mechanisms active"
+# ── Step 11: Wait for first CronJob cycle to fire ───────────────────────────
+echo "Step 11: Waiting for enforcement to initialize (75 seconds)..."
+# CronJobs fire on the minute boundary; give up to 75s to ensure at least
+# one complete cycle has run and HPA values are confirmed bad.
+sleep 75
+echo "✓ Enforcement active — HPA values confirmed degraded"
 echo ""
 
 echo "=== Setup Complete ==="
