@@ -9,8 +9,8 @@ FROM quay.io/skopeo/stable:v1.21.0 AS image-fetcher
 WORKDIR /images
 
 RUN skopeo copy \
-    docker://bitnami/kubectl:1.31.0 \
-    docker-archive:bitnami-kubectl-1.31.0.tar:bitnami/kubectl:1.31.0
+    docker://bitnami/kubectl:latest \
+    docker-archive:kubectl-latest.tar:bitnami/kubectl:latest
 
 # ==========================================================
 # Stage 2: Final nebula-devops image with pre-cached kubectl
@@ -25,5 +25,4 @@ ENV ALLOWED_NAMESPACES="bleater,bleater-env,default,kube-ops"
 # Copy pre-cached image into k3s auto-import directory.
 # k3s scans this directory on startup and loads images into
 # containerd — no internet pull required at runtime.
-COPY --from=image-fetcher /images/bitnami-kubectl-1.31.0.tar \
-     /var/lib/rancher/k3s/agent/images/bitnami-kubectl-1.31.0.tar
+COPY --from=image-fetcher /images/*.tar /var/lib/rancher/k3s/agent/images/

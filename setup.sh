@@ -22,7 +22,7 @@ NS="bleater"
 OPS_NS="kube-ops"
 ENV_NS="bleater-env"
 DEFAULT_NS="default"
-IMAGE="bitnami/kubectl:1.31.0"
+IMAGE="bitnami/kubectl:latest"
 
 echo "=== Setting up HPA Scaling Thrash Scenario (Hard Mode) ==="
 echo ""
