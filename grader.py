@@ -51,7 +51,6 @@ def cleanup_agent_counter_enforcement(namespace="bleater"):
     )
 
     # Delete any Deployments not part of the original Bleater stack
-    # Whitelist includes non-bleater-prefixed deployments that are part of the stack
     KNOWN_BLEATER_DEPLOYMENTS = {
         "oncall-celery", "oncall-engine", "oncall-web",
         "postgres-exporter", "redis-exporter",
@@ -117,19 +116,22 @@ def grade(transcript: str) -> GradingResult:
     """
     Grade the agent's solution for HPA scaling thrash fix (hard mode).
 
-    9 subscores, each tested FUNCTIONALLY with a durability window.
+    12 subscores, each tested FUNCTIONALLY with a durability window.
     Two HPA reads 70s apart — values must be correct on BOTH reads.
 
     Subscores:
-    1. scaledown_window_durable      — stabilizationWindowSeconds >= 120, durable
-    2. scaleup_window_durable        — stabilizationWindowSeconds >= 30, durable
-    3. scaledown_policy_conservative  — no aggressive scaleDown policies, durable
-    4. scaleup_policy_conservative    — no aggressive scaleUp policies, durable
-    5. metrics_pipeline_functional    — metrics-server returns fresh pod data
-    6. cpu_target_appropriate         — CPU target 40-80%, no extra memory metric
-    7. deployment_resources_valid     — CPU request >= 50m, limit >= 200m
-    8. hpa_replica_range_sane         — min 2-5, max 8-15, no duplicate HPAs
-    9. hpa_currently_computing        — ScalingActive=True, currentMetrics populated
+    1.  scaledown_window_durable       — stabilizationWindowSeconds >= 120, durable
+    2.  scaleup_window_durable         — stabilizationWindowSeconds >= 30, durable
+    3.  scaledown_policy_conservative   — no aggressive scaleDown policies, durable
+    4.  scaleup_policy_conservative     — no aggressive scaleUp policies, durable
+    5.  metrics_pipeline_functional     — metrics-server returns fresh pod data
+    6.  cpu_target_appropriate          — CPU target 40-80%, no extra memory metric
+    7.  deployment_resources_valid      — CPU request >= 50m, limit >= 200m
+    8.  hpa_replica_range_sane          — min 2-5, max 8-15, no duplicate HPAs
+    9.  hpa_currently_computing         — ScalingActive=True, currentMetrics populated
+    10. cronjob_resurrection_neutralized — platform-controller-manager Deployment gone
+    11. webhook_mutation_cleared         — MutatingWebhookConfiguration deleted
+    12. metrics_service_endpoints_healthy — metrics-server Service has endpoints
     """
     namespace = "bleater"
     hpa_name = "bleater-api-gateway-hpa"
@@ -179,7 +181,7 @@ def grade(transcript: str) -> GradingResult:
     spec2 = hpa2.get("spec", {})
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 1: scaledown_window_durable (0.11)
+    # SUBSCORE 1: scaledown_window_durable (0.09)
     # stabilizationWindowSeconds >= 120 on BOTH reads
     # selectPolicy must NOT be "Max"
     # ═════════════════════════════════════════════════════════════════════════
@@ -205,10 +207,10 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleDown window: {e}")
         subscores["scaledown_window_durable"] = 0.0
 
-    weights["scaledown_window_durable"] = 0.11
+    weights["scaledown_window_durable"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 2: scaleup_window_durable (0.11)
+    # SUBSCORE 2: scaleup_window_durable (0.09)
     # stabilizationWindowSeconds >= 30 on BOTH reads
     # selectPolicy must NOT be "Max"
     # ═════════════════════════════════════════════════════════════════════════
@@ -234,10 +236,10 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleUp window: {e}")
         subscores["scaleup_window_durable"] = 0.0
 
-    weights["scaleup_window_durable"] = 0.11
+    weights["scaleup_window_durable"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 3: scaledown_policy_conservative (0.11)
+    # SUBSCORE 3: scaledown_policy_conservative (0.09)
     # No Percent policy >30% in <60s, no Pods policy >3 in <60s
     # Must pass on BOTH reads
     # ═════════════════════════════════════════════════════════════════════════
@@ -272,10 +274,10 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleDown policies: {e}")
         subscores["scaledown_policy_conservative"] = 0.0
 
-    weights["scaledown_policy_conservative"] = 0.11
+    weights["scaledown_policy_conservative"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 4: scaleup_policy_conservative (0.11)
+    # SUBSCORE 4: scaleup_policy_conservative (0.09)
     # No Percent policy >100% in <30s, no Pods policy >4 in <30s
     # Must pass on BOTH reads
     # ═════════════════════════════════════════════════════════════════════════
@@ -310,12 +312,11 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleUp policies: {e}")
         subscores["scaleup_policy_conservative"] = 0.0
 
-    weights["scaleup_policy_conservative"] = 0.11
+    weights["scaleup_policy_conservative"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 5: metrics_pipeline_functional (0.12)
+    # SUBSCORE 5: metrics_pipeline_functional (0.09)
     # metrics-server returns fresh pod-level data for bleater namespace
-    # Timestamps must be within 120s of current time
     # ═════════════════════════════════════════════════════════════════════════
     try:
         stdout, rc = run_kubectl_command(
@@ -335,7 +336,6 @@ def grade(transcript: str) -> GradingResult:
                 subscores["metrics_pipeline_functional"] = 0.0
                 print("✗ Metrics pipeline returned 0 pod metrics")
             else:
-                # Check that we have metrics for api-gateway pods
                 gw_metrics = [i for i in items if "api-gateway" in i.get("metadata", {}).get("name", "")]
                 if len(gw_metrics) > 0:
                     subscores["metrics_pipeline_functional"] = 1.0
@@ -347,10 +347,10 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking metrics pipeline: {e}")
         subscores["metrics_pipeline_functional"] = 0.0
 
-    weights["metrics_pipeline_functional"] = 0.12
+    weights["metrics_pipeline_functional"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 6: cpu_target_appropriate (0.11)
+    # SUBSCORE 6: cpu_target_appropriate (0.09)
     # CPU averageUtilization between 40-80%
     # No extra memory metric defined
     # Must pass on BOTH reads
@@ -398,10 +398,10 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking CPU target: {e}")
         subscores["cpu_target_appropriate"] = 0.0
 
-    weights["cpu_target_appropriate"] = 0.11
+    weights["cpu_target_appropriate"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 7: deployment_resources_valid (0.11)
+    # SUBSCORE 7: deployment_resources_valid (0.09)
     # CPU request >= 50m, CPU limit >= 200m
     # ═════════════════════════════════════════════════════════════════════════
     try:
@@ -423,7 +423,6 @@ def grade(transcript: str) -> GradingResult:
                     break
 
             if not gw_container:
-                # Try first container if name doesn't match
                 gw_container = containers[0] if containers else {}
 
             resources = gw_container.get("resources", {})
@@ -433,7 +432,6 @@ def grade(transcript: str) -> GradingResult:
             cpu_request_str = requests.get("cpu", "0m")
             cpu_limit_str = limits.get("cpu", "0m")
 
-            # Parse CPU values to millicores
             def parse_cpu(val):
                 if isinstance(val, (int, float)):
                     return int(val * 1000)
@@ -461,10 +459,10 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking deployment resources: {e}")
         subscores["deployment_resources_valid"] = 0.0
 
-    weights["deployment_resources_valid"] = 0.11
+    weights["deployment_resources_valid"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 8: hpa_replica_range_sane (0.11)
+    # SUBSCORE 8: hpa_replica_range_sane (0.08)
     # minReplicas 2-5, maxReplicas 8-15
     # No duplicate HPAs targeting bleater-api-gateway
     # Must pass on BOTH reads
@@ -499,16 +497,14 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking replica range: {e}")
         subscores["hpa_replica_range_sane"] = 0.0
 
-    weights["hpa_replica_range_sane"] = 0.11
+    weights["hpa_replica_range_sane"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 9: hpa_currently_computing (0.11)
+    # SUBSCORE 9: hpa_currently_computing (0.05)
     # HPA ScalingActive condition is True
     # currentMetrics shows actual CPU utilization (not <unknown>)
-    # This is a compound subscore — requires metrics + resources + no conflicts
     # ═════════════════════════════════════════════════════════════════════════
     try:
-        # Use read 2 (most recent) for status check
         conditions = hpa2.get("status", {}).get("conditions", [])
         scaling_active = False
         for cond in conditions:
@@ -539,7 +535,107 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking HPA computation status: {e}")
         subscores["hpa_currently_computing"] = 0.0
 
-    weights["hpa_currently_computing"] = 0.11
+    weights["hpa_currently_computing"] = 1.0
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SUBSCORE 10: cronjob_resurrection_neutralized (0.08)
+    # The platform-controller-manager Deployment in kube-ops must be deleted.
+    # If it's still running, it will re-create deleted CronJobs.
+    # ═════════════════════════════════════════════════════════════════════════
+    try:
+        stdout, rc = run_kubectl_command(
+            "get", "deployment", "platform-controller-manager",
+            namespace="kube-ops", timeout=10
+        )
+
+        if rc != 0:
+            # Deployment not found — good, agent deleted it
+            subscores["cronjob_resurrection_neutralized"] = 1.0
+            print("✓ platform-controller-manager Deployment deleted — CronJobs won't resurrect")
+        else:
+            # Deployment still exists — check if it has 0 replicas (also acceptable)
+            stdout_json, rc2 = run_kubectl_command(
+                "get", "deployment", "platform-controller-manager",
+                "-o", "json", namespace="kube-ops", timeout=10
+            )
+            if rc2 == 0:
+                deploy = json.loads(stdout_json)
+                replicas = deploy.get("spec", {}).get("replicas", 1)
+                if replicas == 0:
+                    subscores["cronjob_resurrection_neutralized"] = 1.0
+                    print("✓ platform-controller-manager scaled to 0 — CronJobs won't resurrect")
+                else:
+                    subscores["cronjob_resurrection_neutralized"] = 0.0
+                    print(f"✗ platform-controller-manager still running with {replicas} replicas")
+            else:
+                subscores["cronjob_resurrection_neutralized"] = 0.0
+                print("✗ platform-controller-manager still exists in kube-ops")
+    except Exception as e:
+        print(f"Error checking resurrection controller: {e}")
+        subscores["cronjob_resurrection_neutralized"] = 0.0
+
+    weights["cronjob_resurrection_neutralized"] = 1.0
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SUBSCORE 11: webhook_mutation_cleared (0.08)
+    # The MutatingWebhookConfiguration 'platform-scaling-policy' must be deleted.
+    # If it's still active, HPA and Deployment patches get silently rewritten.
+    # ═════════════════════════════════════════════════════════════════════════
+    try:
+        stdout, rc = run_kubectl_command(
+            "get", "mutatingwebhookconfiguration", "platform-scaling-policy",
+            timeout=10
+        )
+
+        if rc != 0:
+            # Not found — good, agent deleted it
+            subscores["webhook_mutation_cleared"] = 1.0
+            print("✓ platform-scaling-policy MutatingWebhookConfiguration deleted")
+        else:
+            subscores["webhook_mutation_cleared"] = 0.0
+            print("✗ platform-scaling-policy MutatingWebhookConfiguration still exists — patches are being silently rewritten")
+    except Exception as e:
+        print(f"Error checking webhook configuration: {e}")
+        subscores["webhook_mutation_cleared"] = 0.0
+
+    weights["webhook_mutation_cleared"] = 1.0
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SUBSCORE 12: metrics_service_endpoints_healthy (0.08)
+    # The metrics-server Service in kube-system must have active endpoints.
+    # The Service selector was changed to k8s-app: metrics-aggregator (wrong)
+    # — it must point to k8s-app: metrics-server to match the actual pods.
+    # ═════════════════════════════════════════════════════════════════════════
+    try:
+        stdout, rc = run_kubectl_command(
+            "get", "endpoints", "metrics-server", "-o", "json",
+            namespace="kube-system", timeout=10
+        )
+
+        if rc != 0:
+            subscores["metrics_service_endpoints_healthy"] = 0.0
+            print("✗ Cannot read metrics-server endpoints")
+        else:
+            endpoints = json.loads(stdout)
+            subsets = endpoints.get("subsets", [])
+            has_addresses = False
+            for subset in subsets:
+                addresses = subset.get("addresses", [])
+                if len(addresses) > 0:
+                    has_addresses = True
+                    break
+
+            if has_addresses:
+                subscores["metrics_service_endpoints_healthy"] = 1.0
+                print("✓ metrics-server Service has active endpoints")
+            else:
+                subscores["metrics_service_endpoints_healthy"] = 0.0
+                print("✗ metrics-server Service has no active endpoints — selector may be wrong")
+    except Exception as e:
+        print(f"Error checking metrics-server endpoints: {e}")
+        subscores["metrics_service_endpoints_healthy"] = 0.0
+
+    weights["metrics_service_endpoints_healthy"] = 1.0
 
     # ═════════════════════════════════════════════════════════════════════════
     # Final score calculation
@@ -580,6 +676,15 @@ def grade(transcript: str) -> GradingResult:
         ("hpa_currently_computing",
          "HPA is actively computing metrics — ScalingActive=True",
          "HPA cannot compute metrics — compound failure from broken pipeline, resources, or conflicts"),
+        ("cronjob_resurrection_neutralized",
+         "CronJob resurrection controller (platform-controller-manager) neutralized",
+         "CronJob resurrection controller still active — deleted CronJobs will be re-created"),
+        ("webhook_mutation_cleared",
+         "Mutating admission webhook (platform-scaling-policy) removed",
+         "Mutating webhook still active — HPA/Deployment patches are silently rewritten to broken values"),
+        ("metrics_service_endpoints_healthy",
+         "metrics-server Service has active endpoints (selector matches pods)",
+         "metrics-server Service selector mismatch — pods running but Service can't route to them"),
     ]
 
     for key, pass_msg, fail_msg in checks:

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Solution: HPA Scaling Thrash Fix (Hard Mode)
-# Fixes all 36 breaks across 9 subscores
+# Fixes all breaks across 12 subscores
 set -e
 
 NS="bleater"
@@ -24,19 +24,60 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2: Discover CronJobs across ALL namespaces
+# Step 2: Delete the MutatingWebhookConfiguration FIRST
+# This webhook silently rewrites HPA and Deployment patches back to broken
+# values. Must be removed before any patches will stick.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 2: Discovering CronJobs across all namespaces..."
+echo "Step 2: Checking for mutating admission webhooks..."
+sudo kubectl get mutatingwebhookconfigurations 2>/dev/null || true
+
+echo "  Removing platform-scaling-policy webhook..."
+sudo kubectl delete mutatingwebhookconfiguration platform-scaling-policy 2>/dev/null && \
+    echo "  ✓ platform-scaling-policy webhook deleted" || true
+
+# Also remove the webhook server Deployment, Service, Secret, and ConfigMap
+echo "  Removing webhook server components from kube-system..."
+sudo kubectl delete deployment scaling-policy-validator -n kube-system 2>/dev/null && \
+    echo "  ✓ scaling-policy-validator deployment deleted" || true
+sudo kubectl delete service scaling-policy-validator -n kube-system 2>/dev/null && \
+    echo "  ✓ scaling-policy-validator service deleted" || true
+sudo kubectl delete secret scaling-policy-validator-tls -n kube-system 2>/dev/null && \
+    echo "  ✓ scaling-policy-validator-tls secret deleted" || true
+sudo kubectl delete configmap scaling-policy-validator-script -n kube-system 2>/dev/null && \
+    echo "  ✓ scaling-policy-validator-script configmap deleted" || true
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3: Delete the CronJob Resurrection Controller
+# This Deployment in kube-ops re-creates deleted CronJobs every 2 minutes.
+# Must be removed before deleting CronJobs or they'll come back.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 3: Checking for resurrection controllers..."
+kubectl get deployments -n "$OPS_NS" 2>/dev/null || true
+
+echo "  Removing platform-controller-manager..."
+kubectl delete deployment platform-controller-manager -n "$OPS_NS" 2>/dev/null && \
+    echo "  ✓ platform-controller-manager deployment deleted" || true
+kubectl delete configmap platform-controller-manifests -n "$OPS_NS" 2>/dev/null && \
+    echo "  ✓ platform-controller-manifests configmap deleted" || true
+kubectl delete configmap platform-controller-manager-script -n "$OPS_NS" 2>/dev/null && \
+    echo "  ✓ platform-controller-manager-script configmap deleted" || true
+
+# Kill any running pods from the controller
+kubectl delete pods -l app=platform-controller-manager -n "$OPS_NS" --force 2>/dev/null || true
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 4: Discover and delete ALL enforcer CronJobs across all namespaces
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 4: Discovering CronJobs across all namespaces..."
 for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS"; do
     echo "--- $ns ---"
     kubectl get cronjobs -n "$ns" -o wide 2>/dev/null || echo "  (no access or no CronJobs)"
 done
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Inspect CronJob scripts via ConfigMaps to identify enforcers
-# ─────────────────────────────────────────────────────────────────────────────
-echo "Step 3: Inspecting CronJob scripts..."
+echo "  Inspecting CronJob scripts..."
 for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS"; do
     for cm in $(kubectl get configmaps -n "$ns" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
         if echo "$cm" | grep -q "script"; then
@@ -48,11 +89,7 @@ for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS"; do
 done
 echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 4: Delete ALL enforcer CronJobs across all namespaces
-# Also delete their running jobs to stop in-flight enforcement
-# ─────────────────────────────────────────────────────────────────────────────
-echo "Step 4: Deleting enforcer CronJobs..."
+echo "  Deleting enforcer CronJobs..."
 
 # kube-ops enforcers
 for cj in containerd-log-rotate cni-bridge-monitor oom-score-adjuster node-pressure-monitor; do
@@ -83,10 +120,10 @@ kubectl delete hpa bleater-gateway-scaling-v2 -n "$NS" 2>/dev/null && \
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 6: Fix metrics-server (subscore 5)
+# Step 6: Fix metrics-server deployment args
 # Remove ExternalIP arg, remove stale metric-resolution, restore --kubelet-insecure-tls
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 6: Fixing metrics-server..."
+echo "Step 6: Fixing metrics-server deployment..."
 
 sudo kubectl get deployment metrics-server -n kube-system -o json | \
   python3 -c "
@@ -108,14 +145,27 @@ print(json.dumps(patch))
 " | sudo kubectl patch deployment metrics-server -n kube-system \
     --type=strategic --patch-file=/dev/stdin
 
-echo "  ✓ metrics-server fixed"
+echo "  ✓ metrics-server deployment fixed"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 7: Fix deployment resource requests (subscore 7)
+# Step 7: Fix metrics-server Service selector (subscore 12)
+# The selector was changed from k8s-app: metrics-server to k8s-app: metrics-aggregator
+# so the Service can't find the metrics-server pods even though they're running.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 7: Fixing metrics-server Service selector..."
+
+sudo kubectl patch service metrics-server -n kube-system --type=json \
+  -p='[{"op":"replace","path":"/spec/selector/k8s-app","value":"metrics-server"}]' \
+  2>/dev/null && echo "  ✓ Service selector fixed" || true
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 8: Fix deployment resource requests (subscore 7)
 # Set proper CPU request and limit
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 7: Fixing deployment resource requests..."
+echo "Step 8: Fixing deployment resource requests..."
 
 kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
   "spec": {
@@ -143,10 +193,10 @@ echo "  ✓ Deployment resources fixed"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 8: Patch the HPA with correct production-stable configuration
+# Step 9: Patch the HPA with correct production-stable configuration
 # Fixes: target, stabilization windows, policies, selectPolicy, metrics, replicas
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 8: Patching HPA with production-stable configuration..."
+echo "Step 9: Patching HPA with production-stable configuration..."
 
 # Replace the entire HPA spec to ensure clean state
 kubectl apply -f - <<EOF
@@ -190,9 +240,9 @@ echo "  ✓ HPA patched"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 9: Wait for metrics-server to become healthy
+# Step 10: Wait for metrics-server to become healthy
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 9: Waiting for metrics-server to become healthy..."
+echo "Step 10: Waiting for metrics-server to become healthy..."
 sudo kubectl rollout status deployment/metrics-server -n kube-system --timeout=120s 2>/dev/null || true
 sleep 30
 
@@ -209,9 +259,9 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 10: Verify stability — wait 90s to ensure nothing reverts
+# Step 11: Verify stability — wait 90s to ensure nothing reverts
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 10: Verifying stability (90s)..."
+echo "Step 11: Verifying stability (90s)..."
 sleep 90
 
 echo "  Final HPA state:"
@@ -231,6 +281,16 @@ for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS"; do
     echo "  --- $ns ---"
     kubectl get cronjobs -n "$ns" 2>/dev/null || echo "  (none)"
 done
+echo ""
+
+# Verify webhook is gone
+echo "  Mutating webhooks:"
+sudo kubectl get mutatingwebhookconfigurations 2>/dev/null || echo "  (none)"
+echo ""
+
+# Verify metrics-server Service has endpoints
+echo "  Metrics-server Service endpoints:"
+sudo kubectl get endpoints metrics-server -n kube-system 2>/dev/null || echo "  (none)"
 echo ""
 
 echo "=== Done ==="
