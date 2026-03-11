@@ -207,7 +207,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleDown window: {e}")
         subscores["scaledown_window_durable"] = 0.0
 
-    weights["scaledown_window_durable"] = 1.0
+    weights["scaledown_window_durable"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 2: scaleup_window_durable (0.09)
@@ -236,7 +236,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleUp window: {e}")
         subscores["scaleup_window_durable"] = 0.0
 
-    weights["scaleup_window_durable"] = 1.0
+    weights["scaleup_window_durable"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 3: scaledown_policy_conservative (0.09)
@@ -274,7 +274,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleDown policies: {e}")
         subscores["scaledown_policy_conservative"] = 0.0
 
-    weights["scaledown_policy_conservative"] = 1.0
+    weights["scaledown_policy_conservative"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 4: scaleup_policy_conservative (0.09)
@@ -312,7 +312,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleUp policies: {e}")
         subscores["scaleup_policy_conservative"] = 0.0
 
-    weights["scaleup_policy_conservative"] = 1.0
+    weights["scaleup_policy_conservative"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 5: metrics_pipeline_functional (0.09)
@@ -347,7 +347,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking metrics pipeline: {e}")
         subscores["metrics_pipeline_functional"] = 0.0
 
-    weights["metrics_pipeline_functional"] = 1.0
+    weights["metrics_pipeline_functional"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 6: cpu_target_appropriate (0.09)
@@ -398,7 +398,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking CPU target: {e}")
         subscores["cpu_target_appropriate"] = 0.0
 
-    weights["cpu_target_appropriate"] = 1.0
+    weights["cpu_target_appropriate"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 7: deployment_resources_valid (0.09)
@@ -459,7 +459,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking deployment resources: {e}")
         subscores["deployment_resources_valid"] = 0.0
 
-    weights["deployment_resources_valid"] = 1.0
+    weights["deployment_resources_valid"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 8: hpa_replica_range_sane (0.08)
@@ -497,7 +497,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking replica range: {e}")
         subscores["hpa_replica_range_sane"] = 0.0
 
-    weights["hpa_replica_range_sane"] = 1.0
+    weights["hpa_replica_range_sane"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 9: hpa_currently_computing (0.05)
@@ -535,7 +535,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking HPA computation status: {e}")
         subscores["hpa_currently_computing"] = 0.0
 
-    weights["hpa_currently_computing"] = 1.0
+    weights["hpa_currently_computing"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 10: cronjob_resurrection_neutralized (0.08)
@@ -574,7 +574,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking resurrection controller: {e}")
         subscores["cronjob_resurrection_neutralized"] = 0.0
 
-    weights["cronjob_resurrection_neutralized"] = 1.0
+    weights["cronjob_resurrection_neutralized"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 11: webhook_mutation_cleared (0.08)
@@ -598,7 +598,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking webhook configuration: {e}")
         subscores["webhook_mutation_cleared"] = 0.0
 
-    weights["webhook_mutation_cleared"] = 1.0
+    weights["webhook_mutation_cleared"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 12: metrics_service_endpoints_healthy (0.08)
@@ -635,7 +635,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking metrics-server endpoints: {e}")
         subscores["metrics_service_endpoints_healthy"] = 0.0
 
-    weights["metrics_service_endpoints_healthy"] = 1.0
+    weights["metrics_service_endpoints_healthy"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # Final score calculation
