@@ -10,8 +10,8 @@ prompt: |
 
   [Task]
   The bleater-api-gateway service is experiencing severe Horizontal Pod Autoscaler (HPA) instability.
-  The HPA is rapidly scaling between 3 and 12 replicas every 4-6 minutes despite steady traffic,
-  generating approximately 87 scaling events per hour.
+  The HPA is rapidly scaling between minimum and maximum replicas every few minutes despite steady traffic,
+  generating excessive scaling events per hour.
 
   This scaling thrash is causing:
   - Unnecessary pod churn and resource waste
@@ -19,17 +19,20 @@ prompt: |
   - High CPU usage from constant pod startup/shutdown
   - Alert fatigue from scaling notifications
 
-  Your task is to identify and fix the HPA configuration issues to eliminate the scaling
-  thrash while maintaining appropriate responsiveness to load changes.
+  Your task is to investigate and fix ALL the issues contributing to the HPA instability.
+  The problems span multiple areas — the HPA configuration itself, supporting cluster
+  components, workload resource definitions, and potentially conflicting resources.
 
   The HPA `bleater-api-gateway-hpa` has already been created but is misconfigured.
-  You should modify the existing HPA resource to fix the scaling behavior.
 
-  Additionally, some cluster components may not be functioning correctly.
+  Additionally, some cluster components may not be functioning correctly, and there may
+  be automated processes in the cluster that interfere with manual corrections.
 
   Verify the fix by ensuring:
   - The HPA is no longer thrashing
   - Scaling behavior is stable and appropriate for production workloads
+  - All corrections persist over time (are not reverted by other processes)
+  - The metrics pipeline is healthy and the HPA can compute actual utilization
 
   IMPORTANT: Do NOT use any interactive commands, for example `-i` or `-it`, in `docker exec`,
   or any other TTY commands.
