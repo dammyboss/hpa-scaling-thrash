@@ -51,13 +51,18 @@ def cleanup_agent_counter_enforcement(namespace="bleater"):
     )
 
     # Delete any Deployments not part of the original Bleater stack
+    # Whitelist includes non-bleater-prefixed deployments that are part of the stack
+    KNOWN_BLEATER_DEPLOYMENTS = {
+        "oncall-celery", "oncall-engine", "oncall-web",
+        "postgres-exporter", "redis-exporter",
+    }
     result = subprocess.run(
         ["kubectl", "get", "deployments", "-n", namespace,
          "-o", "jsonpath={.items[*].metadata.name}"],
         capture_output=True, text=True, timeout=15
     )
     for name in result.stdout.strip().split():
-        if name and not name.startswith("bleater-"):
+        if name and not name.startswith("bleater-") and name not in KNOWN_BLEATER_DEPLOYMENTS:
             print(f"  Deleting agent-created deployment: {name}")
             subprocess.run(
                 ["kubectl", "delete", "deployment", name, "-n", namespace],
@@ -76,7 +81,10 @@ def cleanup_agent_counter_enforcement(namespace="bleater"):
             continue
         pod_name = parts[0]
         owner = parts[1] if len(parts) > 1 else "<none>"
-        if owner == "<none>" and not pod_name.startswith("bleater-"):
+        is_known = pod_name.startswith("bleater-") or any(
+            pod_name.startswith(prefix) for prefix in KNOWN_BLEATER_DEPLOYMENTS
+        )
+        if owner == "<none>" and not is_known:
             print(f"  Deleting agent-created pod: {pod_name}")
             subprocess.run(
                 ["kubectl", "delete", "pod", pod_name, "-n", namespace],
