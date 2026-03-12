@@ -1,6 +1,7 @@
 import subprocess
 import json
 import time
+import os
 from apex_arena._types import GradingResult
 
 
@@ -129,9 +130,9 @@ def grade(transcript: str) -> GradingResult:
     7.  deployment_resources_valid      — CPU request >= 50m, limit >= 200m
     8.  hpa_replica_range_sane          — min 2-5, max 8-15, no duplicate HPAs
     9.  hpa_currently_computing         — ScalingActive=True, currentMetrics populated
-    10. cronjob_resurrection_neutralized — platform-controller-manager Deployment gone
-    11. webhook_mutation_cleared         — MutatingWebhookConfiguration deleted
-    12. metrics_service_endpoints_healthy — metrics-server Service has endpoints
+    10. limitrange_not_blocking           — LimitRange max cpu allows >= 50m
+    11. apiservice_correctly_configured   — APIService points to metrics-server
+    12. static_pod_enforcer_removed       — static pod manifest removed from disk
     """
     namespace = "bleater"
     hpa_name = "bleater-api-gateway-hpa"
@@ -538,104 +539,122 @@ def grade(transcript: str) -> GradingResult:
     weights["hpa_currently_computing"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 10: cronjob_resurrection_neutralized (0.08)
-    # The platform-controller-manager Deployment in kube-ops must be deleted.
-    # If it's still running, it will re-create deleted CronJobs.
+    # SUBSCORE 10: limitrange_not_blocking (0.08)
+    # The LimitRange 'bleater-resource-governance' in bleater namespace
+    # has max.cpu=20m which blocks setting proper deployment resources.
+    # It must be deleted or modified to allow cpu >= 50m.
     # ═════════════════════════════════════════════════════════════════════════
     try:
         stdout, rc = run_kubectl_command(
-            "get", "deployment", "platform-controller-manager",
-            namespace="kube-ops", timeout=10
+            "get", "limitrange", "-o", "json",
+            namespace=namespace, timeout=10
         )
 
         if rc != 0:
-            # Deployment not found — good, agent deleted it
-            subscores["cronjob_resurrection_neutralized"] = 1.0
-            print("✓ platform-controller-manager Deployment deleted — CronJobs won't resurrect")
+            # Can't read — assume it might still be there
+            subscores["limitrange_not_blocking"] = 0.0
+            print("✗ Cannot read LimitRange resources in bleater namespace")
         else:
-            # Deployment still exists — check if it has 0 replicas (also acceptable)
-            stdout_json, rc2 = run_kubectl_command(
-                "get", "deployment", "platform-controller-manager",
-                "-o", "json", namespace="kube-ops", timeout=10
-            )
-            if rc2 == 0:
-                deploy = json.loads(stdout_json)
-                replicas = deploy.get("spec", {}).get("replicas", 1)
-                if replicas == 0:
-                    subscores["cronjob_resurrection_neutralized"] = 1.0
-                    print("✓ platform-controller-manager scaled to 0 — CronJobs won't resurrect")
-                else:
-                    subscores["cronjob_resurrection_neutralized"] = 0.0
-                    print(f"✗ platform-controller-manager still running with {replicas} replicas")
+            lr_list = json.loads(stdout)
+            items = lr_list.get("items", [])
+            blocking = False
+
+            for lr in items:
+                lr_name = lr.get("metadata", {}).get("name", "")
+                limits = lr.get("spec", {}).get("limits", [])
+                for limit in limits:
+                    if limit.get("type") == "Container":
+                        max_cpu = limit.get("max", {}).get("cpu", "")
+                        if max_cpu:
+                            # Parse the max CPU value
+                            if max_cpu.endswith("m"):
+                                max_val = int(max_cpu[:-1])
+                            else:
+                                max_val = int(float(max_cpu) * 1000)
+                            if max_val < 50:
+                                blocking = True
+                                print(f"✗ LimitRange '{lr_name}' has max.cpu={max_cpu} — blocks setting cpu >= 50m")
+
+            if not blocking:
+                subscores["limitrange_not_blocking"] = 1.0
+                print("✓ No LimitRange blocking deployment resource fixes")
             else:
-                subscores["cronjob_resurrection_neutralized"] = 0.0
-                print("✗ platform-controller-manager still exists in kube-ops")
+                subscores["limitrange_not_blocking"] = 0.0
     except Exception as e:
-        print(f"Error checking resurrection controller: {e}")
-        subscores["cronjob_resurrection_neutralized"] = 0.0
+        print(f"Error checking LimitRange: {e}")
+        subscores["limitrange_not_blocking"] = 0.0
 
-    weights["cronjob_resurrection_neutralized"] = 1/12
+    weights["limitrange_not_blocking"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 11: webhook_mutation_cleared (0.08)
-    # The MutatingWebhookConfiguration 'platform-scaling-policy' must be deleted.
-    # If it's still active, HPA and Deployment patches get silently rewritten.
+    # SUBSCORE 11: apiservice_correctly_configured (0.08)
+    # The APIService v1beta1.metrics.k8s.io must point to the correct
+    # service (metrics-server) in kube-system. If it points to a wrong
+    # service name, the API server can't proxy metrics requests.
     # ═════════════════════════════════════════════════════════════════════════
     try:
         stdout, rc = run_kubectl_command(
-            "get", "mutatingwebhookconfiguration", "platform-scaling-policy",
-            timeout=10
+            "get", "apiservice", "v1beta1.metrics.k8s.io",
+            "-o", "json", timeout=10
         )
 
         if rc != 0:
-            # Not found — good, agent deleted it
-            subscores["webhook_mutation_cleared"] = 1.0
-            print("✓ platform-scaling-policy MutatingWebhookConfiguration deleted")
+            subscores["apiservice_correctly_configured"] = 0.0
+            print("✗ Cannot read APIService v1beta1.metrics.k8s.io")
         else:
-            subscores["webhook_mutation_cleared"] = 0.0
-            print("✗ platform-scaling-policy MutatingWebhookConfiguration still exists — patches are being silently rewritten")
-    except Exception as e:
-        print(f"Error checking webhook configuration: {e}")
-        subscores["webhook_mutation_cleared"] = 0.0
+            apiservice = json.loads(stdout)
+            service_ref = apiservice.get("spec", {}).get("service", {})
+            service_name = service_ref.get("name", "")
+            service_ns = service_ref.get("namespace", "")
 
-    weights["webhook_mutation_cleared"] = 1/12
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 12: metrics_service_endpoints_healthy (0.08)
-    # The metrics-server Service in kube-system must have active endpoints.
-    # The Service selector was changed to k8s-app: metrics-aggregator (wrong)
-    # — it must point to k8s-app: metrics-server to match the actual pods.
-    # ═════════════════════════════════════════════════════════════════════════
-    try:
-        stdout, rc = run_kubectl_command(
-            "get", "endpoints", "metrics-server", "-o", "json",
-            namespace="kube-system", timeout=10
-        )
-
-        if rc != 0:
-            subscores["metrics_service_endpoints_healthy"] = 0.0
-            print("✗ Cannot read metrics-server endpoints")
-        else:
-            endpoints = json.loads(stdout)
-            subsets = endpoints.get("subsets", [])
-            has_addresses = False
-            for subset in subsets:
-                addresses = subset.get("addresses", [])
-                if len(addresses) > 0:
-                    has_addresses = True
-                    break
-
-            if has_addresses:
-                subscores["metrics_service_endpoints_healthy"] = 1.0
-                print("✓ metrics-server Service has active endpoints")
+            if service_name == "metrics-server" and service_ns == "kube-system":
+                subscores["apiservice_correctly_configured"] = 1.0
+                print(f"✓ APIService points to {service_ns}/{service_name}")
             else:
-                subscores["metrics_service_endpoints_healthy"] = 0.0
-                print("✗ metrics-server Service has no active endpoints — selector may be wrong")
+                subscores["apiservice_correctly_configured"] = 0.0
+                print(f"✗ APIService points to {service_ns}/{service_name} — should be kube-system/metrics-server")
     except Exception as e:
-        print(f"Error checking metrics-server endpoints: {e}")
-        subscores["metrics_service_endpoints_healthy"] = 0.0
+        print(f"Error checking APIService: {e}")
+        subscores["apiservice_correctly_configured"] = 0.0
 
-    weights["metrics_service_endpoints_healthy"] = 1/12
+    weights["apiservice_correctly_configured"] = 1/12
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SUBSCORE 12: static_pod_enforcer_removed (0.08)
+    # A static pod manifest at /var/lib/rancher/k3s/agent/pod-manifests/
+    # continuously reverts HPA config and recreates deleted CronJobs.
+    # Static pods can't be deleted via kubectl — the manifest file must
+    # be removed from disk to stop the pod.
+    # ═════════════════════════════════════════════════════════════════════════
+    try:
+        manifest_dir = "/var/lib/rancher/k3s/agent/pod-manifests"
+        enforcer_found = False
+
+        if os.path.isdir(manifest_dir):
+            for f in os.listdir(manifest_dir):
+                fpath = os.path.join(manifest_dir, f)
+                if os.path.isfile(fpath) and f.endswith((".yaml", ".yml")):
+                    try:
+                        with open(fpath, "r") as fh:
+                            content = fh.read()
+                        # Check if this manifest patches HPA or recreates CronJobs
+                        if "bleater-api-gateway-hpa" in content or "platform-controller-manifests" in content:
+                            enforcer_found = True
+                            print(f"✗ Static pod enforcer manifest found: {fpath}")
+                            break
+                    except Exception:
+                        pass
+
+        if not enforcer_found:
+            subscores["static_pod_enforcer_removed"] = 1.0
+            print("✓ No static pod enforcer manifests found — enforcement stopped")
+        else:
+            subscores["static_pod_enforcer_removed"] = 0.0
+    except Exception as e:
+        print(f"Error checking static pod manifests: {e}")
+        subscores["static_pod_enforcer_removed"] = 0.0
+
+    weights["static_pod_enforcer_removed"] = 1/12
 
     # ═════════════════════════════════════════════════════════════════════════
     # Final score calculation
@@ -676,15 +695,15 @@ def grade(transcript: str) -> GradingResult:
         ("hpa_currently_computing",
          "HPA is actively computing metrics — ScalingActive=True",
          "HPA cannot compute metrics — compound failure from broken pipeline, resources, or conflicts"),
-        ("cronjob_resurrection_neutralized",
-         "CronJob resurrection controller (platform-controller-manager) neutralized",
-         "CronJob resurrection controller still active — deleted CronJobs will be re-created"),
-        ("webhook_mutation_cleared",
-         "Mutating admission webhook (platform-scaling-policy) removed",
-         "Mutating webhook still active — HPA/Deployment patches are silently rewritten to broken values"),
-        ("metrics_service_endpoints_healthy",
-         "metrics-server Service has active endpoints (selector matches pods)",
-         "metrics-server Service selector mismatch — pods running but Service can't route to them"),
+        ("limitrange_not_blocking",
+         "LimitRange not blocking deployment resource fixes (max cpu allows >= 50m)",
+         "LimitRange max.cpu too low — prevents setting proper deployment CPU requests/limits"),
+        ("apiservice_correctly_configured",
+         "APIService v1beta1.metrics.k8s.io points to correct metrics-server service",
+         "APIService misconfigured — API server proxying metrics to wrong service"),
+        ("static_pod_enforcer_removed",
+         "Static pod enforcer manifest removed from disk — enforcement stopped",
+         "Static pod enforcer still active — continuously reverting HPA config and recreating CronJobs"),
     ]
 
     for key, pass_msg, fail_msg in checks:

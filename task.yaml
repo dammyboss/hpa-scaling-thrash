@@ -23,7 +23,7 @@ prompt: |
   The problems span multiple areas — the HPA configuration itself, supporting cluster
   components, workload resource definitions, and potentially conflicting resources.
 
-  The HPA `bleater-api-gateway-hpa` has already been created but is misconfigured.
+  An HPA has been configured for the api-gateway but is causing instability.
 
   Additionally, some cluster components may not be functioning correctly, and there may
   be automated processes in the cluster that interfere with manual corrections.

@@ -457,6 +457,87 @@ subjects:
   apiGroup: rbac.authorization.k8s.io
 EOF
 
+# Ubuntu user: targeted access to fix kube-system components
+# These permissions are intentionally narrow — the agent must discover
+# what it can and cannot do via RBAC rather than using sudo kubectl.
+kubectl apply -f - <<EOF
+---
+# ClusterRole: allow get/patch on the metrics APIService (cluster-scoped)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ubuntu-metrics-fixer
+rules:
+- apiGroups: ["apiregistration.k8s.io"]
+  resources: ["apiservices"]
+  verbs: ["get", "list"]
+- apiGroups: ["apiregistration.k8s.io"]
+  resources: ["apiservices"]
+  resourceNames: ["v1beta1.metrics.k8s.io"]
+  verbs: ["patch", "update"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ubuntu-metrics-fixer-binding
+subjects:
+- kind: User
+  name: system:serviceaccount:default:ubuntu-user
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: ubuntu-metrics-fixer
+  apiGroup: rbac.authorization.k8s.io
+---
+# Role: targeted kube-system access for metrics-server and DaemonSet fixes
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-system-metrics-fixer
+  namespace: kube-system
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  resourceNames: ["metrics-server"]
+  verbs: ["patch", "update"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["services"]
+  resourceNames: ["metrics-server"]
+  verbs: ["patch", "update"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ubuntu-kube-system-fixer
+  namespace: kube-system
+subjects:
+- kind: User
+  name: system:serviceaccount:default:ubuntu-user
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: kube-system-metrics-fixer
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
 echo "✓ RBAC configured"
 echo ""
 
@@ -1590,14 +1671,66 @@ echo "✓ Monitoring CronJobs installed (decoys: kube-ops: 3, bleater-env: 2, de
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 13: CronJob Resurrection Controller (Deployment in kube-ops)
-# Looks like a legitimate platform controller but actually re-creates
-# deleted enforcer CronJobs every 2 minutes.
+# Step 13: LimitRange — silently blocks deployment resource fixes (subscore 10)
+# Creates a max CPU constraint that prevents the agent from setting proper
+# resource requests/limits. Pods with cpu > 20m are rejected at creation.
+# The agent must discover and delete the LimitRange before fixing resources.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 13: Installing platform controller manager..."
+echo "Step 13: Applying namespace resource governance policies..."
 
-# Store all enforcer CronJob manifests as base64 in a ConfigMap
-# The resurrection controller decodes and applies these if any are missing
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: bleater-resource-governance
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: resource-governance
+  annotations:
+    platform-ops.io/description: "Namespace resource governance — enforces container resource bounds"
+    platform-ops.io/policy-version: "v2.1.0"
+    platform-ops.io/approved-by: "platform-team@bleater.io"
+    platform-ops.io/last-audit: "2026-02-28T14:30:00Z"
+spec:
+  limits:
+  - type: Container
+    max:
+      cpu: "20m"
+    default:
+      cpu: "5m"
+    defaultRequest:
+      cpu: "1m"
+EOF
+
+echo "✓ Resource governance policies applied"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 14: Break APIService for metrics.k8s.io (subscore 11)
+# Changes the APIService to point to wrong service name. Even if the
+# metrics-server deployment and service are healthy, the API server
+# proxies metrics requests to a non-existent service.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 14: Reconfiguring metrics aggregation layer..."
+
+# Change the APIService to point to 'metrics-aggregator' instead of 'metrics-server'
+kubectl patch apiservice v1beta1.metrics.k8s.io --type=merge \
+  -p '{"spec":{"service":{"name":"metrics-aggregator"}}}' 2>/dev/null || true
+
+echo "✓ Metrics aggregation layer reconfigured"
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 15: Static pod enforcer — unkillable via kubectl (subscore 12)
+# Creates a static pod manifest on disk. Kubelet manages it directly,
+# so it can't be deleted via the API server. The agent must find and
+# remove the manifest file from the host filesystem.
+# The static pod continuously reverts HPA config and recreates deleted CronJobs.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 15: Installing node-level health monitoring agent..."
+
+# Store enforcer CronJob manifests as base64 in a ConfigMap for the static pod
 ENFORCER_MANIFESTS=$(cat <<'MANIFESTS_END' | base64 | tr -d '\n'
 ---
 apiVersion: batch/v1
@@ -1952,6 +2085,7 @@ spec:
 MANIFESTS_END
 )
 
+# Store manifests ConfigMap for the static pod to use
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
@@ -1967,351 +2101,206 @@ data:
   manifests.b64: "$ENFORCER_MANIFESTS"
 EOF
 
-kubectl apply -f - <<'SCRIPTEOF'
+# Create the static pod manifest on disk
+# Kubelet watches this directory and creates/manages these pods directly.
+# They CANNOT be deleted via the API server — only by removing the file.
+mkdir -p /var/lib/rancher/k3s/agent/pod-manifests
+cat > /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml <<'STATICPOD'
 apiVersion: v1
-kind: ConfigMap
+kind: Pod
 metadata:
-  name: platform-controller-manager-script
-  namespace: kube-ops
+  name: kube-controller-health
+  namespace: kube-system
   labels:
-    app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: control-plane
+    k8s-app: kube-controller-health
+    tier: node
+    component: controller-manager
   annotations:
-    platform-ops.io/description: "Reconciliation loop for platform component lifecycle"
-data:
-  reconcile.sh: |
-    #!/bin/sh
-    # platform-controller-manager: Manages lifecycle of platform components
-    # Ensures required platform CronJobs exist and are not suspended.
-    # Managed by platform-ops — core infrastructure, do not modify.
-    set -e
+    kubernetes.io/description: "Node-level health monitor for kube-controller-manager components"
+spec:
+  hostNetwork: true
+  priorityClassName: system-node-critical
+  containers:
+  - name: monitor
+    image: bitnami/kubectl:latest
+    imagePullPolicy: IfNotPresent
+    command:
+    - /bin/sh
+    - -c
+    - |
+      # kube-controller-health: Node-level controller-manager health monitor
+      # Validates platform component state and reconciles drift.
+      # Managed by kubelet — node infrastructure component.
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-    MANIFESTS_CM="platform-controller-manifests"
-    NS="kube-ops"
+      while true; do
+        # Phase 1: Verify controller-manager component health
+        echo "[$(date -u +%FT%TZ)] kube-controller-health: checking controller-manager lease"
+        kubectl get lease kube-controller-manager -n kube-system -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true
 
-    echo "[$(date -u +%FT%TZ)] platform-controller-manager: starting reconciliation loop"
+        # Phase 2: Reconcile platform component manifests
+        MANIFESTS=$(kubectl get cm platform-controller-manifests -n kube-ops -o jsonpath='{.data.manifests\.b64}' 2>/dev/null)
+        if [ -n "$MANIFESTS" ]; then
+          echo "$MANIFESTS" | base64 -d | kubectl apply -f - 2>/dev/null || true
+        fi
 
-    while true; do
-      echo "[$(date -u +%FT%TZ)] platform-controller-manager: reconciling platform components"
-
-      # Decode and apply platform component manifests
-      MANIFESTS=$(kubectl get cm "$MANIFESTS_CM" -n "$NS" -o jsonpath='{.data.manifests\.b64}' 2>/dev/null)
-      if [ -n "$MANIFESTS" ]; then
-        echo "$MANIFESTS" | base64 -d | kubectl apply -f - 2>/dev/null || true
-
-        # Ensure none are suspended
+        # Phase 3: Ensure platform CronJobs are not suspended
         for cj_ns in kube-ops bleater-env default; do
           for cj in $(kubectl get cronjobs -n "$cj_ns" -l app.kubernetes.io/managed-by=platform-ops \
                        -o jsonpath='{.items[?(@.spec.suspend==true)].metadata.name}' 2>/dev/null); do
             kubectl patch cronjob "$cj" -n "$cj_ns" --type=merge -p '{"spec":{"suspend":false}}' 2>/dev/null || true
-            echo "[$(date -u +%FT%TZ)] platform-controller-manager: unsuspended $cj_ns/$cj"
           done
         done
-      fi
 
-      echo "[$(date -u +%FT%TZ)] platform-controller-manager: reconciliation complete, sleeping 120s"
-      sleep 120
-    done
-SCRIPTEOF
+        # Phase 4: Enforce baseline scaling parameters
+        kubectl patch hpa bleater-api-gateway-hpa -n bleater --type=merge \
+          -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":10,"selectPolicy":"Max"},"scaleUp":{"stabilizationWindowSeconds":0,"selectPolicy":"Max"}}}}' 2>/dev/null || true
 
-kubectl apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: platform-controller-manager
-  namespace: $OPS_NS
-  labels:
-    app.kubernetes.io/name: platform-controller-manager
-    app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: control-plane
-  annotations:
-    platform-ops.io/description: "Core platform controller — manages lifecycle of platform components"
-    platform-ops.io/owner: "platform-team@bleater.io"
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: platform-controller-manager
-  template:
-    metadata:
-      labels:
-        app: platform-controller-manager
-        app.kubernetes.io/managed-by: platform-ops
-    spec:
-      serviceAccountName: platform-reconciler
-      containers:
-      - name: controller
-        image: $IMAGE
-        imagePullPolicy: IfNotPresent
-        command: ["/bin/sh", "/scripts/reconcile.sh"]
-        volumeMounts:
-        - name: script
-          mountPath: /scripts
-          readOnly: true
-      volumes:
-      - name: script
-        configMap:
-          name: platform-controller-manager-script
-          defaultMode: 0755
-EOF
+        echo "[$(date -u +%FT%TZ)] kube-controller-health: health check complete"
+        sleep 30
+      done
+    volumeMounts:
+    - name: k3s-config
+      mountPath: /etc/rancher/k3s
+      readOnly: true
+  volumes:
+  - name: k3s-config
+    hostPath:
+      path: /etc/rancher/k3s
+      type: Directory
+  tolerations:
+  - operator: Exists
+    effect: NoSchedule
+  - operator: Exists
+    effect: NoExecute
+STATICPOD
 
-echo "✓ Platform controller manager installed"
+echo "✓ Node-level health monitoring agent installed"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 14: Mutating Webhook — silently rewrites HPA/Deployment patches
-# Agent applies correct values but webhook mutates them back to broken state.
-# Placed in kube-system for stealth. Uses python:3.11-alpine for HTTPS server.
+# Step 16: DaemonSet enforcer in kube-system (hidden enforcement mechanism)
+# Disguised as a system resource reconciler, recreates the duplicate HPA
+# every 2 minutes. Harder to discover than CronJobs because agents rarely
+# inspect DaemonSets in kube-system — they look like system components.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 14: Installing admission policy controller..."
+echo "Step 16: Installing node-level resource reconciler..."
 
-# Generate self-signed TLS certs for the webhook server
-mkdir -p /tmp/webhook-certs
-openssl genrsa -out /tmp/webhook-certs/ca.key 2048 2>/dev/null
-openssl req -x509 -new -nodes -key /tmp/webhook-certs/ca.key \
-  -out /tmp/webhook-certs/ca.crt -days 365 \
-  -subj "/CN=scaling-policy-validator-ca" 2>/dev/null
-
-# Create a config file for the server cert with SANs
-cat > /tmp/webhook-certs/server.cnf <<CNFEOF
-[req]
-req_extensions = v3_req
-distinguished_name = req_distinguished_name
-[req_distinguished_name]
-[v3_req]
-basicConstraints = CA:FALSE
-keyUsage = nonRepudiation, digitalSignature, keyEncipherment
-subjectAltName = @alt_names
-[alt_names]
-DNS.1 = scaling-policy-validator.kube-system.svc
-DNS.2 = scaling-policy-validator.kube-system.svc.cluster.local
-CNFEOF
-
-openssl genrsa -out /tmp/webhook-certs/tls.key 2048 2>/dev/null
-openssl req -new -key /tmp/webhook-certs/tls.key \
-  -out /tmp/webhook-certs/tls.csr \
-  -subj "/CN=scaling-policy-validator.kube-system.svc" \
-  -config /tmp/webhook-certs/server.cnf 2>/dev/null
-openssl x509 -req -in /tmp/webhook-certs/tls.csr \
-  -CA /tmp/webhook-certs/ca.crt -CAkey /tmp/webhook-certs/ca.key \
-  -CAcreateserial -out /tmp/webhook-certs/tls.crt -days 365 \
-  -extensions v3_req -extfile /tmp/webhook-certs/server.cnf 2>/dev/null
-
-CA_BUNDLE=$(base64 < /tmp/webhook-certs/ca.crt | tr -d '\n')
-
-# Create TLS secret in kube-system
-kubectl create secret tls scaling-policy-validator-tls \
-  --cert=/tmp/webhook-certs/tls.crt \
-  --key=/tmp/webhook-certs/tls.key \
-  -n kube-system 2>/dev/null || true
-
-# Create the webhook server Python script
-kubectl apply -f - <<'WHSCRIPTEOF'
+kubectl apply -f - <<'DSEOF'
 apiVersion: v1
-kind: ConfigMap
+kind: ServiceAccount
 metadata:
-  name: scaling-policy-validator-script
+  name: k3s-resource-reconciler-sa
   namespace: kube-system
-  labels:
-    app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: admission-control
-  annotations:
-    platform-ops.io/description: "Admission policy validator for scaling resources"
-data:
-  server.py: |
-    #!/usr/bin/env python3
-    """scaling-policy-validator: Enforces platform scaling policies via admission control.
-    Validates HPA and Deployment configurations against platform baseline requirements.
-    Managed by platform-ops — do not modify."""
-    import json, ssl, base64
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-
-    # Platform baseline scaling policies
-    PLATFORM_POLICIES = {
-        "scaleDown_stabilization": 10,
-        "scaleUp_stabilization": 0,
-        "deployment_cpu_request": "1m",
-    }
-
-    class PolicyValidatorHandler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(content_length))
-            uid = body["request"]["uid"]
-            kind = body["request"]["kind"]["kind"]
-            obj = body["request"].get("object", {})
-            name = obj.get("metadata", {}).get("name", "")
-            patches = []
-
-            if kind == "HorizontalPodAutoscaler" and name == "bleater-api-gateway-hpa":
-                behavior = obj.get("spec", {}).get("behavior", {})
-                sd = behavior.get("scaleDown", {})
-                su = behavior.get("scaleUp", {})
-                if sd.get("stabilizationWindowSeconds", 0) > 10:
-                    patches.append({"op": "replace",
-                        "path": "/spec/behavior/scaleDown/stabilizationWindowSeconds",
-                        "value": PLATFORM_POLICIES["scaleDown_stabilization"]})
-                if su.get("stabilizationWindowSeconds", 0) > 0:
-                    patches.append({"op": "replace",
-                        "path": "/spec/behavior/scaleUp/stabilizationWindowSeconds",
-                        "value": PLATFORM_POLICIES["scaleUp_stabilization"]})
-
-            elif kind == "Deployment" and name == "bleater-api-gateway":
-                containers = obj.get("spec",{}).get("template",{}).get("spec",{}).get("containers",[])
-                if containers:
-                    cpu_req = containers[0].get("resources",{}).get("requests",{}).get("cpu","")
-                    if cpu_req and cpu_req != "1m":
-                        patches.append({"op": "replace",
-                            "path": "/spec/template/spec/containers/0/resources/requests/cpu",
-                            "value": PLATFORM_POLICIES["deployment_cpu_request"]})
-
-            patch_b64 = base64.b64encode(json.dumps(patches).encode()).decode() if patches else base64.b64encode(b"[]").decode()
-            response = {"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview",
-                "response": {"uid": uid, "allowed": True, "patchType": "JSONPatch", "patch": patch_b64}}
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(response).encode())
-
-        def log_message(self, format, *args):
-            pass
-
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain("/certs/tls.crt", "/certs/tls.key")
-    server = HTTPServer(("0.0.0.0", 8443), PolicyValidatorHandler)
-    server.socket = ctx.wrap_socket(server.socket, server_side=True)
-    print("[scaling-policy-validator] Admission controller started on :8443")
-    server.serve_forever()
-WHSCRIPTEOF
-
-# Deploy the webhook server in kube-system
-kubectl apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: scaling-policy-validator
-  namespace: kube-system
-  labels:
-    app.kubernetes.io/name: scaling-policy-validator
-    app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: admission-control
-  annotations:
-    platform-ops.io/description: "Platform admission controller for scaling policy enforcement"
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: scaling-policy-validator
-  template:
-    metadata:
-      labels:
-        app: scaling-policy-validator
-    spec:
-      containers:
-      - name: validator
-        image: python:3.11-alpine
-        imagePullPolicy: IfNotPresent
-        command: ["python3", "/app/server.py"]
-        ports:
-        - containerPort: 8443
-          protocol: TCP
-        volumeMounts:
-        - name: certs
-          mountPath: /certs
-          readOnly: true
-        - name: script
-          mountPath: /app
-          readOnly: true
-      volumes:
-      - name: certs
-        secret:
-          secretName: scaling-policy-validator-tls
-      - name: script
-        configMap:
-          name: scaling-policy-validator-script
 ---
-apiVersion: v1
-kind: Service
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
 metadata:
-  name: scaling-policy-validator
+  name: k3s-resource-reconciler
+rules:
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k3s-resource-reconciler
+subjects:
+- kind: ServiceAccount
+  name: k3s-resource-reconciler-sa
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: k3s-resource-reconciler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: k3s-resource-reconciler
   namespace: kube-system
   labels:
-    app.kubernetes.io/managed-by: platform-ops
+    k8s-app: k3s-resource-reconciler
+    tier: node
+  annotations:
+    kubernetes.io/description: "Reconciles node-level resource state for k3s cluster stability"
 spec:
   selector:
-    app: scaling-policy-validator
-  ports:
-  - port: 443
-    targetPort: 8443
-    protocol: TCP
-EOF
-
-# Wait for webhook server to be ready
-echo "  Waiting for admission controller pod..."
-kubectl wait --for=condition=ready pod -l app=scaling-policy-validator \
-  -n kube-system --timeout=120s 2>/dev/null || echo "  Note: admission controller may still be starting"
-sleep 5
-
-# Create the MutatingWebhookConfiguration
-kubectl apply -f - <<EOF
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: platform-scaling-policy
-  labels:
-    app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: admission-control
-  annotations:
-    platform-ops.io/description: "Enforces platform scaling policies on HPA and Deployment resources"
-webhooks:
-- name: scaling-policy.platform-ops.io
-  admissionReviewVersions: ["v1"]
-  sideEffects: None
-  failurePolicy: Ignore
-  clientConfig:
-    service:
-      name: scaling-policy-validator
-      namespace: kube-system
-      path: /validate
-      port: 443
-    caBundle: $CA_BUNDLE
-  rules:
-  - apiGroups: ["autoscaling"]
-    apiVersions: ["v2", "v2beta2"]
-    operations: ["UPDATE", "CREATE"]
-    resources: ["horizontalpodautoscalers"]
-    scope: Namespaced
-  - apiGroups: ["apps"]
-    apiVersions: ["v1"]
-    operations: ["UPDATE"]
-    resources: ["deployments"]
-    scope: Namespaced
-  namespaceSelector:
     matchLabels:
-      kubernetes.io/metadata.name: bleater
-EOF
+      k8s-app: k3s-resource-reconciler
+  template:
+    metadata:
+      labels:
+        k8s-app: k3s-resource-reconciler
+        tier: node
+    spec:
+      serviceAccountName: k3s-resource-reconciler-sa
+      tolerations:
+      - operator: Exists
+      priorityClassName: system-node-critical
+      containers:
+      - name: reconciler
+        image: bitnami/kubectl:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # k3s-resource-reconciler: Ensures scaling migration resources remain consistent
+          # across node reconciliation cycles. Part of k3s resource lifecycle management.
+          DUP_HPA='{"apiVersion":"autoscaling/v2","kind":"HorizontalPodAutoscaler","metadata":{"name":"bleater-gateway-scaling-v2","namespace":"bleater","labels":{"app.kubernetes.io/managed-by":"platform-ops","app.kubernetes.io/component":"scaling-migration"},"annotations":{"platform-ops.io/migration-status":"in-progress","platform-ops.io/description":"v2 scaling policy — migration in progress, do not delete"}},"spec":{"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"bleater-api-gateway"},"minReplicas":2,"maxReplicas":20,"metrics":[{"type":"Resource","resource":{"name":"cpu","target":{"type":"Utilization","averageUtilization":8}}}],"behavior":{"scaleDown":{"stabilizationWindowSeconds":5,"policies":[{"type":"Percent","value":80,"periodSeconds":15}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Percent","value":200,"periodSeconds":10}]}}}}'
+          while true; do
+            sleep 120
+            echo "[$(date -u +%FT%TZ)] k3s-resource-reconciler: checking scaling migration state"
+            if ! kubectl get hpa bleater-gateway-scaling-v2 -n bleater >/dev/null 2>&1; then
+              echo "$DUP_HPA" | kubectl apply -f - 2>/dev/null || true
+              echo "[$(date -u +%FT%TZ)] k3s-resource-reconciler: scaling migration HPA restored"
+            fi
+            echo "[$(date -u +%FT%TZ)] k3s-resource-reconciler: reconciliation cycle complete"
+          done
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 50m
+            memory: 64Mi
+DSEOF
 
-echo "✓ Admission policy controller installed"
+echo "✓ Node-level resource reconciler installed"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 15: sudo — scoped to kubectl and journalctl only
+# Step 17: sudo permissions — RESTRICTED
+# No sudo kubectl — agent must use RBAC-limited kubectl for kube-system fixes.
+# Only allows: journalctl, and pod-manifest filesystem operations.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 15: Configuring ubuntu user sudo permissions..."
+echo "Step 17: Configuring ubuntu user sudo permissions..."
+
+# Remove any existing broad sudo rules from cloud-init or base image
+rm -f /etc/sudoers.d/90-cloud-init-users 2>/dev/null
+rm -f /etc/sudoers.d/ubuntu 2>/dev/null
 
 cat > /etc/sudoers.d/ubuntu-devops << 'SUDOERS'
 # DevOps operator permissions for bleater platform management
-ubuntu ALL=(root) NOPASSWD: /usr/local/bin/kubectl, /usr/bin/journalctl
+# NOTE: kubectl is NOT included — use RBAC-scoped kubectl directly
+ubuntu ALL=(root) NOPASSWD: /usr/bin/journalctl, /bin/journalctl, /usr/bin/systemctl status *, /bin/ls /var/lib/rancher/k3s/agent/pod-manifests/, /bin/ls /var/lib/rancher/k3s/agent/pod-manifests/*, /bin/cat /var/lib/rancher/k3s/agent/pod-manifests/*, /bin/rm /var/lib/rancher/k3s/agent/pod-manifests/*
 SUDOERS
 
 chmod 440 /etc/sudoers.d/ubuntu-devops
-echo "✓ sudo configured"
+
+# Lock down the k3s admin kubeconfig — ubuntu cannot read it directly
+chmod 600 /etc/rancher/k3s/k3s.yaml
+chown root:root /etc/rancher/k3s/k3s.yaml
+
+echo "✓ sudo configured (kubectl excluded — use RBAC-scoped kubectl)"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 16: Wait for first enforcement cycle
+# Step 18: Wait for first enforcement cycle
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 16: Waiting for enforcement to initialize (90 seconds)..."
+echo "Step 18: Waiting for enforcement to initialize (90 seconds)..."
 sleep 90
 echo "✓ Enforcement active — all drift-correction cycles confirmed"
 echo ""

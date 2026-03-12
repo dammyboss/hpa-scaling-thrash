@@ -24,53 +24,57 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2: Delete the MutatingWebhookConfiguration FIRST
-# This webhook silently rewrites HPA and Deployment patches back to broken
-# values. Must be removed before any patches will stick.
+# Step 2: Remove the static pod enforcer FIRST
+# This is a static pod managed by kubelet — can't be deleted via kubectl.
+# Must remove the manifest file from disk to stop it.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 2: Checking for mutating admission webhooks..."
-sudo kubectl get mutatingwebhookconfigurations 2>/dev/null || true
+echo "Step 2: Checking for static pod enforcers..."
 
-echo "  Removing platform-scaling-policy webhook..."
-sudo kubectl delete mutatingwebhookconfiguration platform-scaling-policy 2>/dev/null && \
-    echo "  ✓ platform-scaling-policy webhook deleted" || true
+# List static pod manifests
+sudo ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || true
 
-# Also remove the webhook server Deployment, Service, Secret, and ConfigMap
-echo "  Removing webhook server components from kube-system..."
-sudo kubectl delete deployment scaling-policy-validator -n kube-system 2>/dev/null && \
-    echo "  ✓ scaling-policy-validator deployment deleted" || true
-sudo kubectl delete service scaling-policy-validator -n kube-system 2>/dev/null && \
-    echo "  ✓ scaling-policy-validator service deleted" || true
-sudo kubectl delete secret scaling-policy-validator-tls -n kube-system 2>/dev/null && \
-    echo "  ✓ scaling-policy-validator-tls secret deleted" || true
-sudo kubectl delete configmap scaling-policy-validator-script -n kube-system 2>/dev/null && \
-    echo "  ✓ scaling-policy-validator-script configmap deleted" || true
+# Remove the enforcer manifest
+if sudo cat /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa"; then
+    sudo rm /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml
+    echo "  ✓ Static pod enforcer manifest removed"
+else
+    echo "  No enforcer static pod found"
+fi
+
+# Wait for kubelet to remove the static pod
+sleep 15
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Delete the CronJob Resurrection Controller
-# This Deployment in kube-ops re-creates deleted CronJobs every 2 minutes.
-# Must be removed before deleting CronJobs or they'll come back.
+# Step 3: Delete the LimitRange blocking resource fixes
+# The LimitRange has max.cpu=20m which prevents setting proper CPU resources.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 3: Checking for resurrection controllers..."
-kubectl get deployments -n "$OPS_NS" 2>/dev/null || true
+echo "Step 3: Checking for blocking LimitRanges..."
+kubectl get limitrange -n "$NS" 2>/dev/null || true
 
-echo "  Removing platform-controller-manager..."
-kubectl delete deployment platform-controller-manager -n "$OPS_NS" 2>/dev/null && \
-    echo "  ✓ platform-controller-manager deployment deleted" || true
-kubectl delete configmap platform-controller-manifests -n "$OPS_NS" 2>/dev/null && \
-    echo "  ✓ platform-controller-manifests configmap deleted" || true
-kubectl delete configmap platform-controller-manager-script -n "$OPS_NS" 2>/dev/null && \
-    echo "  ✓ platform-controller-manager-script configmap deleted" || true
-
-# Kill any running pods from the controller
-kubectl delete pods -l app=platform-controller-manager -n "$OPS_NS" --force 2>/dev/null || true
+kubectl delete limitrange bleater-resource-governance -n "$NS" 2>/dev/null && \
+    echo "  ✓ bleater-resource-governance LimitRange deleted" || true
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 4: Discover and delete ALL enforcer CronJobs across all namespaces
+# Step 4: Fix the APIService for metrics.k8s.io
+# The APIService points to 'metrics-aggregator' instead of 'metrics-server'
+# Use RBAC-scoped kubectl (no sudo needed — ubuntu-metrics-fixer ClusterRole)
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 4: Discovering CronJobs across all namespaces..."
+echo "Step 4: Fixing APIService configuration..."
+
+kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.spec.service}' 2>/dev/null
+echo ""
+
+kubectl patch apiservice v1beta1.metrics.k8s.io --type=merge \
+  -p '{"spec":{"service":{"name":"metrics-server","namespace":"kube-system"}}}' 2>/dev/null && \
+    echo "  ✓ APIService fixed to point to metrics-server" || true
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 5: Discover and delete ALL enforcer CronJobs across all namespaces
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 5: Discovering CronJobs across all namespaces..."
 for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS"; do
     echo "--- $ns ---"
     kubectl get cronjobs -n "$ns" -o wide 2>/dev/null || echo "  (no access or no CronJobs)"
@@ -112,20 +116,42 @@ kubectl delete jobs --all -n "$DEFAULT_NS" 2>/dev/null || true
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 5: Delete the duplicate conflicting HPA (subscore 8)
+# Step 6: Delete the DaemonSet enforcer in kube-system that recreates duplicate HPA
+# This is disguised as k3s-resource-reconciler — a system-looking DaemonSet.
+# Must be deleted BEFORE the duplicate HPA, otherwise it recreates it.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 5: Removing duplicate HPA..."
+echo "Step 6: Checking for hidden enforcement in kube-system..."
+
+# List DaemonSets in kube-system and look for suspicious ones
+kubectl get daemonsets -n kube-system 2>/dev/null
+echo ""
+
+# Delete the DaemonSet enforcer
+kubectl delete daemonset k3s-resource-reconciler -n kube-system 2>/dev/null && \
+    echo "  ✓ k3s-resource-reconciler DaemonSet deleted" || true
+
+# Clean up its RBAC resources
+kubectl delete clusterrolebinding k3s-resource-reconciler 2>/dev/null || true
+kubectl delete clusterrole k3s-resource-reconciler 2>/dev/null || true
+kubectl delete serviceaccount k3s-resource-reconciler-sa -n kube-system 2>/dev/null || true
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 6b: Delete the duplicate conflicting HPA (subscore 8)
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 6b: Removing duplicate HPA..."
 kubectl delete hpa bleater-gateway-scaling-v2 -n "$NS" 2>/dev/null && \
     echo "  ✓ bleater-gateway-scaling-v2 deleted" || true
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 6: Fix metrics-server deployment args
+# Step 7: Fix metrics-server deployment args
 # Remove ExternalIP arg, remove stale metric-resolution, restore --kubelet-insecure-tls
+# Use RBAC-scoped kubectl (kube-system-metrics-fixer Role grants patch on metrics-server)
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 6: Fixing metrics-server deployment..."
+echo "Step 7: Fixing metrics-server deployment..."
 
-sudo kubectl get deployment metrics-server -n kube-system -o json | \
+kubectl get deployment metrics-server -n kube-system -o json | \
   python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -142,30 +168,30 @@ args.append('--metric-resolution=15s')
 c['args'] = args
 patch = {'spec': {'template': {'spec': {'containers': [{'name': c['name'], 'args': c['args']}]}}}}
 print(json.dumps(patch))
-" | sudo kubectl patch deployment metrics-server -n kube-system \
+" | kubectl patch deployment metrics-server -n kube-system \
     --type=strategic --patch-file=/dev/stdin
 
 echo "  ✓ metrics-server deployment fixed"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 7: Fix metrics-server Service selector (subscore 12)
+# Step 8: Fix metrics-server Service selector
 # The selector was changed from k8s-app: metrics-server to k8s-app: metrics-aggregator
-# so the Service can't find the metrics-server pods even though they're running.
+# Use RBAC-scoped kubectl (kube-system-metrics-fixer Role grants patch on metrics-server)
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 7: Fixing metrics-server Service selector..."
+echo "Step 8: Fixing metrics-server Service selector..."
 
-sudo kubectl patch service metrics-server -n kube-system --type=json \
+kubectl patch service metrics-server -n kube-system --type=json \
   -p='[{"op":"replace","path":"/spec/selector/k8s-app","value":"metrics-server"}]' \
   2>/dev/null && echo "  ✓ Service selector fixed" || true
 
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 8: Fix deployment resource requests (subscore 7)
+# Step 9: Fix deployment resource requests (subscore 7)
 # Set proper CPU request and limit
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 8: Fixing deployment resource requests..."
+echo "Step 9: Fixing deployment resource requests..."
 
 kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
   "spec": {
@@ -193,10 +219,10 @@ echo "  ✓ Deployment resources fixed"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 9: Patch the HPA with correct production-stable configuration
+# Step 10: Patch the HPA with correct production-stable configuration
 # Fixes: target, stabilization windows, policies, selectPolicy, metrics, replicas
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 9: Patching HPA with production-stable configuration..."
+echo "Step 10: Patching HPA with production-stable configuration..."
 
 # Replace the entire HPA spec to ensure clean state
 kubectl apply -f - <<EOF
@@ -240,16 +266,16 @@ echo "  ✓ HPA patched"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 10: Wait for metrics-server to become healthy
+# Step 11: Wait for metrics-server to become healthy
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 10: Waiting for metrics-server to become healthy..."
-sudo kubectl rollout status deployment/metrics-server -n kube-system --timeout=120s 2>/dev/null || true
+echo "Step 11: Waiting for metrics-server to become healthy..."
+kubectl rollout status deployment/metrics-server -n kube-system --timeout=120s 2>/dev/null || true
 sleep 30
 
 # Verify metrics are flowing
 echo "  Checking metrics API..."
 for i in 1 2 3 4 5; do
-    if sudo kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes 2>/dev/null | grep -q '"items"'; then
+    if kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes 2>/dev/null | grep -q '"items"'; then
         echo "  ✓ Metrics API healthy"
         break
     fi
@@ -259,9 +285,9 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 11: Verify stability — wait 90s to ensure nothing reverts
+# Step 12: Verify stability — wait 90s to ensure nothing reverts
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 11: Verifying stability (90s)..."
+echo "Step 12: Verifying stability (90s)..."
 sleep 90
 
 echo "  Final HPA state:"
@@ -283,14 +309,19 @@ for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS"; do
 done
 echo ""
 
-# Verify webhook is gone
-echo "  Mutating webhooks:"
-sudo kubectl get mutatingwebhookconfigurations 2>/dev/null || echo "  (none)"
+# Verify no blocking LimitRange
+echo "  LimitRanges in bleater:"
+kubectl get limitrange -n "$NS" 2>/dev/null || echo "  (none)"
 echo ""
 
-# Verify metrics-server Service has endpoints
-echo "  Metrics-server Service endpoints:"
-sudo kubectl get endpoints metrics-server -n kube-system 2>/dev/null || echo "  (none)"
+# Verify APIService is correct
+echo "  APIService v1beta1.metrics.k8s.io:"
+kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.spec.service}' 2>/dev/null
+echo ""
+
+# Verify static pod manifest is gone
+echo "  Static pod manifests:"
+sudo ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || echo "  (directory empty or gone)"
 echo ""
 
 echo "=== Done ==="

@@ -12,10 +12,6 @@ RUN skopeo copy \
     docker://bitnami/kubectl:latest \
     docker-archive:kubectl-latest.tar:bitnami/kubectl:latest
 
-RUN skopeo copy \
-    docker://python:3.11-alpine \
-    docker-archive:python-3.11-alpine.tar:python:3.11-alpine
-
 # ==========================================================
 # Stage 2: Final nebula-devops image with pre-cached images
 # ==========================================================
