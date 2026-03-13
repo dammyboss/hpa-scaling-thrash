@@ -91,6 +91,20 @@ def cleanup_agent_counter_enforcement(namespace="bleater"):
                 capture_output=True, timeout=15
             )
 
+    # Unsuspend any CronJobs in kube-system that agent may have only suspended
+    result = subprocess.run(
+        ["kubectl", "get", "cronjobs", "-n", "kube-system",
+         "-o", "jsonpath={.items[*].metadata.name}"],
+        capture_output=True, text=True, timeout=15
+    )
+    for cj_name in result.stdout.strip().split():
+        if cj_name:
+            subprocess.run(
+                ["kubectl", "patch", "cronjob", cj_name, "-n", "kube-system",
+                 "--type=merge", "-p", '{"spec":{"suspend":false}}'],
+                capture_output=True, timeout=10
+            )
+
     # Wait 90s — each real CronJob fires on the minute boundary.
     # If the agent deleted the CronJobs, the HPA stays good.
     # If the agent only ran counter-loops, the CronJobs refire and revert.
@@ -121,8 +135,8 @@ def grade(transcript: str) -> GradingResult:
     Two HPA reads 70s apart — values must be correct on BOTH reads.
 
     Subscores:
-    1.  scaledown_window_durable       — stabilizationWindowSeconds >= 120, durable
-    2.  scaleup_window_durable         — stabilizationWindowSeconds >= 30, durable
+    1.  scaledown_window_durable       — stabilizationWindowSeconds >= 180, durable
+    2.  scaleup_window_durable         — stabilizationWindowSeconds >= 45, durable
     3.  scaledown_policy_conservative   — no aggressive scaleDown policies, durable
     4.  scaleup_policy_conservative     — no aggressive scaleUp policies, durable
     5.  metrics_pipeline_functional     — metrics-server returns fresh pod data
@@ -133,6 +147,7 @@ def grade(transcript: str) -> GradingResult:
     10. limitrange_not_blocking           — LimitRange max cpu allows >= 50m
     11. apiservice_correctly_configured   — APIService points to metrics-server
     12. static_pod_enforcer_removed       — static pod manifest removed from disk
+    13. k3s_autodeploy_enforcer_removed   — k3s server manifest removed from disk
     """
     namespace = "bleater"
     hpa_name = "bleater-api-gateway-hpa"
@@ -192,7 +207,7 @@ def grade(transcript: str) -> GradingResult:
         sd_select1 = sd1.get("selectPolicy", "Max")
         sd_select2 = sd2.get("selectPolicy", "Max")
 
-        window_ok = sd_window1 >= 120 and sd_window2 >= 120
+        window_ok = sd_window1 >= 180 and sd_window2 >= 180
         select_ok = sd_select1 != "Max" and sd_select2 != "Max"
 
         if window_ok and select_ok:
@@ -201,14 +216,14 @@ def grade(transcript: str) -> GradingResult:
         else:
             subscores["scaledown_window_durable"] = 0.0
             if not window_ok:
-                print(f"✗ ScaleDown window: {sd_window1}s/{sd_window2}s (need >= 120 on both reads)")
+                print(f"✗ ScaleDown window: {sd_window1}s/{sd_window2}s (need >= 180 on both reads)")
             if not select_ok:
                 print(f"✗ ScaleDown selectPolicy: {sd_select1}/{sd_select2} (must not be Max)")
     except Exception as e:
         print(f"Error checking scaleDown window: {e}")
         subscores["scaledown_window_durable"] = 0.0
 
-    weights["scaledown_window_durable"] = 1/12
+    weights["scaledown_window_durable"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 2: scaleup_window_durable (0.09)
@@ -221,7 +236,7 @@ def grade(transcript: str) -> GradingResult:
         su_select1 = su1.get("selectPolicy", "Max")
         su_select2 = su2.get("selectPolicy", "Max")
 
-        window_ok = su_window1 >= 30 and su_window2 >= 30
+        window_ok = su_window1 >= 45 and su_window2 >= 45
         select_ok = su_select1 != "Max" and su_select2 != "Max"
 
         if window_ok and select_ok:
@@ -230,14 +245,14 @@ def grade(transcript: str) -> GradingResult:
         else:
             subscores["scaleup_window_durable"] = 0.0
             if not window_ok:
-                print(f"✗ ScaleUp window: {su_window1}s/{su_window2}s (need >= 30 on both reads)")
+                print(f"✗ ScaleUp window: {su_window1}s/{su_window2}s (need >= 45 on both reads)")
             if not select_ok:
                 print(f"✗ ScaleUp selectPolicy: {su_select1}/{su_select2} (must not be Max)")
     except Exception as e:
         print(f"Error checking scaleUp window: {e}")
         subscores["scaleup_window_durable"] = 0.0
 
-    weights["scaleup_window_durable"] = 1/12
+    weights["scaleup_window_durable"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 3: scaledown_policy_conservative (0.09)
@@ -248,12 +263,18 @@ def grade(transcript: str) -> GradingResult:
         policies = sd.get("policies", [])
         if not policies:
             return False, "no policies defined"
+        # Must have at least one Pods-type policy for predictable per-step scaling
+        has_pods_policy = any(p.get("type") == "Pods" for p in policies)
+        if not has_pods_policy:
+            return False, "no Pods-type policy defined (need predictable per-step scaling)"
         for p in policies:
             ptype = p.get("type", "")
             value = p.get("value", 0)
             period = p.get("periodSeconds", 0)
             if ptype == "Percent" and value > 30 and period < 60:
                 return False, f"Percent {value}%/{period}s too aggressive"
+            if ptype == "Percent" and value > 50:
+                return False, f"Percent {value}% too high regardless of period"
             if ptype == "Pods" and value > 3 and period < 60:
                 return False, f"Pods {value}/{period}s too aggressive"
         return True, "ok"
@@ -275,7 +296,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleDown policies: {e}")
         subscores["scaledown_policy_conservative"] = 0.0
 
-    weights["scaledown_policy_conservative"] = 1/12
+    weights["scaledown_policy_conservative"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 4: scaleup_policy_conservative (0.09)
@@ -286,12 +307,18 @@ def grade(transcript: str) -> GradingResult:
         policies = su.get("policies", [])
         if not policies:
             return False, "no policies defined"
+        # Must have at least one Pods-type policy for predictable per-step scaling
+        has_pods_policy = any(p.get("type") == "Pods" for p in policies)
+        if not has_pods_policy:
+            return False, "no Pods-type policy defined (need predictable per-step scaling)"
         for p in policies:
             ptype = p.get("type", "")
             value = p.get("value", 0)
             period = p.get("periodSeconds", 0)
             if ptype == "Percent" and value > 100 and period < 30:
                 return False, f"Percent {value}%/{period}s too aggressive"
+            if ptype == "Percent" and value > 200:
+                return False, f"Percent {value}% too high regardless of period"
             if ptype == "Pods" and value > 4 and period < 30:
                 return False, f"Pods {value}/{period}s too aggressive"
         return True, "ok"
@@ -313,7 +340,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking scaleUp policies: {e}")
         subscores["scaleup_policy_conservative"] = 0.0
 
-    weights["scaleup_policy_conservative"] = 1/12
+    weights["scaleup_policy_conservative"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 5: metrics_pipeline_functional (0.09)
@@ -339,8 +366,26 @@ def grade(transcript: str) -> GradingResult:
             else:
                 gw_metrics = [i for i in items if "api-gateway" in i.get("metadata", {}).get("name", "")]
                 if len(gw_metrics) > 0:
-                    subscores["metrics_pipeline_functional"] = 1.0
-                    print(f"✓ Metrics pipeline healthy — {len(gw_metrics)} api-gateway pod metrics available")
+                    # Also verify metrics-server deployment is healthy
+                    ms_stdout, ms_rc = run_kubectl_command(
+                        "get", "deployment", "metrics-server", "-o", "json",
+                        namespace="kube-system", timeout=10
+                    )
+                    ms_healthy = False
+                    if ms_rc == 0:
+                        ms_deploy = json.loads(ms_stdout)
+                        ready = ms_deploy.get("status", {}).get("readyReplicas", 0)
+                        ms_args = ms_deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [{}])[0].get("args", [])
+                        has_insecure_tls = any("--kubelet-insecure-tls" in a for a in ms_args)
+                        if ready > 0 and has_insecure_tls:
+                            ms_healthy = True
+
+                    if ms_healthy:
+                        subscores["metrics_pipeline_functional"] = 1.0
+                        print(f"✓ Metrics pipeline healthy — {len(gw_metrics)} api-gateway pod metrics, metrics-server ready")
+                    else:
+                        subscores["metrics_pipeline_functional"] = 0.0
+                        print(f"✗ Metrics available but metrics-server deployment unhealthy or missing --kubelet-insecure-tls")
                 else:
                     subscores["metrics_pipeline_functional"] = 0.0
                     print(f"✗ Metrics available for {len(items)} pods but none for api-gateway")
@@ -348,7 +393,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking metrics pipeline: {e}")
         subscores["metrics_pipeline_functional"] = 0.0
 
-    weights["metrics_pipeline_functional"] = 1/12
+    weights["metrics_pipeline_functional"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 6: cpu_target_appropriate (0.09)
@@ -399,7 +444,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking CPU target: {e}")
         subscores["cpu_target_appropriate"] = 0.0
 
-    weights["cpu_target_appropriate"] = 1/12
+    weights["cpu_target_appropriate"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 7: deployment_resources_valid (0.09)
@@ -460,7 +505,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking deployment resources: {e}")
         subscores["deployment_resources_valid"] = 0.0
 
-    weights["deployment_resources_valid"] = 1/12
+    weights["deployment_resources_valid"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 8: hpa_replica_range_sane (0.08)
@@ -498,7 +543,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking replica range: {e}")
         subscores["hpa_replica_range_sane"] = 0.0
 
-    weights["hpa_replica_range_sane"] = 1/12
+    weights["hpa_replica_range_sane"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 9: hpa_currently_computing (0.05)
@@ -536,7 +581,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking HPA computation status: {e}")
         subscores["hpa_currently_computing"] = 0.0
 
-    weights["hpa_currently_computing"] = 1/12
+    weights["hpa_currently_computing"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 10: limitrange_not_blocking (0.08)
@@ -584,7 +629,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking LimitRange: {e}")
         subscores["limitrange_not_blocking"] = 0.0
 
-    weights["limitrange_not_blocking"] = 1/12
+    weights["limitrange_not_blocking"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 11: apiservice_correctly_configured (0.08)
@@ -617,7 +662,7 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking APIService: {e}")
         subscores["apiservice_correctly_configured"] = 0.0
 
-    weights["apiservice_correctly_configured"] = 1/12
+    weights["apiservice_correctly_configured"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 12: static_pod_enforcer_removed (0.08)
@@ -654,7 +699,51 @@ def grade(transcript: str) -> GradingResult:
         print(f"Error checking static pod manifests: {e}")
         subscores["static_pod_enforcer_removed"] = 0.0
 
-    weights["static_pod_enforcer_removed"] = 1/12
+    weights["static_pod_enforcer_removed"] = 1/13
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SUBSCORE 13: k3s_autodeploy_enforcer_removed (1/13)
+    # K3s auto-deploy manifests in /var/lib/rancher/k3s/server/manifests/
+    # are automatically reconciled by k3s. Any manifest there that patches
+    # the HPA must be removed from disk AND the created CronJob must be gone.
+    # ═════════════════════════════════════════════════════════════════════════
+    try:
+        server_manifest_dir = "/var/lib/rancher/k3s/server/manifests"
+        enforcer_found = False
+
+        if os.path.isdir(server_manifest_dir):
+            for f in os.listdir(server_manifest_dir):
+                fpath = os.path.join(server_manifest_dir, f)
+                if os.path.isfile(fpath) and f.endswith((".yaml", ".yml")):
+                    try:
+                        with open(fpath, "r") as fh:
+                            content = fh.read()
+                        if "bleater-api-gateway-hpa" in content or "platform-compliance" in content:
+                            enforcer_found = True
+                            print(f"✗ K3s auto-deploy enforcer manifest found: {fpath}")
+                            break
+                    except Exception:
+                        pass
+
+        # Also check if the CronJob still exists in kube-system
+        stdout, rc = run_kubectl_command(
+            "get", "cronjob", "platform-compliance-audit",
+            namespace="kube-system", timeout=10
+        )
+        if rc == 0 and stdout:
+            enforcer_found = True
+            print("✗ platform-compliance-audit CronJob still exists in kube-system")
+
+        if not enforcer_found:
+            subscores["k3s_autodeploy_enforcer_removed"] = 1.0
+            print("✓ No k3s auto-deploy enforcer manifests found")
+        else:
+            subscores["k3s_autodeploy_enforcer_removed"] = 0.0
+    except Exception as e:
+        print(f"Error checking k3s auto-deploy manifests: {e}")
+        subscores["k3s_autodeploy_enforcer_removed"] = 0.0
+
+    weights["k3s_autodeploy_enforcer_removed"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
     # Final score calculation
@@ -669,10 +758,10 @@ def grade(transcript: str) -> GradingResult:
 
     checks = [
         ("scaledown_window_durable",
-         "ScaleDown cooldown window >= 120s and selectPolicy != Max (durable)",
+         "ScaleDown cooldown window >= 180s and selectPolicy != Max (durable)",
          "ScaleDown cooldown too short or selectPolicy=Max — pods removed too aggressively"),
         ("scaleup_window_durable",
-         "ScaleUp dampening window >= 30s and selectPolicy != Max (durable)",
+         "ScaleUp dampening window >= 45s and selectPolicy != Max (durable)",
          "ScaleUp reacts too fast or selectPolicy=Max — no dampening for transient spikes"),
         ("scaledown_policy_conservative",
          "ScaleDown policies conservative — won't remove >30% pods in <60s",
@@ -704,6 +793,9 @@ def grade(transcript: str) -> GradingResult:
         ("static_pod_enforcer_removed",
          "Static pod enforcer manifest removed from disk — enforcement stopped",
          "Static pod enforcer still active — continuously reverting HPA config and recreating CronJobs"),
+        ("k3s_autodeploy_enforcer_removed",
+         "K3s auto-deploy enforcer manifest removed from /var/lib/rancher/k3s/server/manifests/",
+         "K3s auto-deploy enforcer still active — k3s recreates compliance CronJob from server manifest"),
     ]
 
     for key, pass_msg, fail_msg in checks:

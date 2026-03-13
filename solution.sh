@@ -1,6 +1,6 @@
 #!/bin/bash
 # Solution: HPA Scaling Thrash Fix (Hard Mode)
-# Fixes all breaks across 12 subscores
+# Fixes all breaks across 13 subscores
 set -e
 
 NS="bleater"
@@ -25,24 +25,53 @@ echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2: Remove the static pod enforcer FIRST
-# This is a static pod managed by kubelet — can't be deleted via kubectl.
-# Must remove the manifest file from disk to stop it.
+# The manifest is protected with chattr +i (immutable flag).
+# Must clear immutable flag before removing.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Step 2: Checking for static pod enforcers..."
 
 # List static pod manifests
 sudo ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || true
 
-# Remove the enforcer manifest
+# Remove immutable flag first, then delete the manifest
 if sudo cat /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa"; then
+    sudo chattr -i /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml 2>/dev/null || true
     sudo rm /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml
-    echo "  ✓ Static pod enforcer manifest removed"
+    echo "  ✓ Static pod enforcer manifest removed (immutable flag cleared)"
 else
     echo "  No enforcer static pod found"
 fi
 
 # Wait for kubelet to remove the static pod
 sleep 15
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2b: Remove k3s auto-deploy server manifest (subscore 13)
+# k3s auto-reconciles manifests in /var/lib/rancher/k3s/server/manifests/
+# Even if we delete the CronJob, k3s will recreate it from the manifest file.
+# Must remove the FILE from disk first.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 2b: Checking for k3s auto-deploy enforcement manifests..."
+
+sudo ls /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || true
+
+if sudo cat /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa\|platform-compliance"; then
+    sudo rm /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml
+    echo "  ✓ k3s auto-deploy enforcement manifest removed"
+else
+    echo "  No auto-deploy enforcement manifest found"
+fi
+
+# Delete the CronJob and its RBAC that was created by the manifest
+kubectl delete cronjob platform-compliance-audit -n kube-system 2>/dev/null && \
+    echo "  ✓ platform-compliance-audit CronJob deleted" || true
+kubectl delete clusterrolebinding platform-compliance-auditor 2>/dev/null || true
+kubectl delete clusterrole platform-compliance-auditor 2>/dev/null || true
+kubectl delete serviceaccount platform-compliance-sa -n kube-system 2>/dev/null || true
+kubectl delete jobs --all -n kube-system 2>/dev/null || true
+
+sleep 10
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +104,7 @@ echo ""
 # Step 5: Discover and delete ALL enforcer CronJobs across all namespaces
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Step 5: Discovering CronJobs across all namespaces..."
-for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS"; do
+for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS" "kube-system"; do
     echo "--- $ns ---"
     kubectl get cronjobs -n "$ns" -o wide 2>/dev/null || echo "  (no access or no CronJobs)"
 done
@@ -221,6 +250,8 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 10: Patch the HPA with correct production-stable configuration
 # Fixes: target, stabilization windows, policies, selectPolicy, metrics, replicas
+# Must include BOTH Percent and Pods policies to satisfy grader requirements
+# Stabilization: scaleDown >= 180s, scaleUp >= 45s
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Step 10: Patching HPA with production-stable configuration..."
 
@@ -253,12 +284,18 @@ spec:
       - type: Percent
         value: 10
         periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
     scaleUp:
       stabilizationWindowSeconds: 60
       selectPolicy: Min
       policies:
       - type: Percent
         value: 50
+        periodSeconds: 60
+      - type: Pods
+        value: 3
         periodSeconds: 60
 EOF
 
@@ -303,7 +340,7 @@ echo ""
 
 # Verify no enforcers remain
 echo "  Remaining CronJobs:"
-for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS"; do
+for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS" "kube-system"; do
     echo "  --- $ns ---"
     kubectl get cronjobs -n "$ns" 2>/dev/null || echo "  (none)"
 done
@@ -322,6 +359,11 @@ echo ""
 # Verify static pod manifest is gone
 echo "  Static pod manifests:"
 sudo ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || echo "  (directory empty or gone)"
+echo ""
+
+# Verify k3s server manifest is gone
+echo "  K3s server manifests (checking for enforcement):"
+sudo ls /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || echo "  (directory empty or gone)"
 echo ""
 
 echo "=== Done ==="

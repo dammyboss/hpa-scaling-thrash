@@ -25,9 +25,6 @@ prompt: |
 
   An HPA has been configured for the api-gateway but is causing instability.
 
-  Additionally, some cluster components may not be functioning correctly, and there may
-  be automated processes in the cluster that interfere with manual corrections.
-
   Verify the fix by ensuring:
   - The HPA is no longer thrashing
   - Scaling behavior is stable and appropriate for production workloads
