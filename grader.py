@@ -522,12 +522,17 @@ def grade(transcript: str) -> GradingResult:
         range_ok1 = (2 <= min1 <= 5) and (8 <= max1 <= 15)
         range_ok2 = (2 <= min2 <= 5) and (8 <= max2 <= 15)
 
-        # Check for duplicate HPAs
+        # Check for duplicate HPAs targeting bleater-api-gateway
         stdout, rc = run_kubectl_command(
             "get", "hpa", "-o", "json", namespace=namespace, timeout=10
         )
         hpa_list = json.loads(stdout) if rc == 0 else {"items": []}
-        hpa_count = len(hpa_list.get("items", []))
+        # Only count HPAs that target bleater-api-gateway deployment
+        gateway_hpas = [
+            h for h in hpa_list.get("items", [])
+            if h.get("spec", {}).get("scaleTargetRef", {}).get("name", "") == "bleater-api-gateway"
+        ]
+        hpa_count = len(gateway_hpas)
         no_duplicates = hpa_count == 1
 
         if range_ok1 and range_ok2 and no_duplicates:
@@ -558,7 +563,7 @@ def grade(transcript: str) -> GradingResult:
                 scaling_active = True
                 break
 
-        current_metrics = hpa2.get("status", {}).get("currentMetrics", [])
+        current_metrics = hpa2.get("status", {}).get("currentMetrics") or []
         has_cpu_metric = False
         for cm in current_metrics:
             if cm.get("type") == "Resource":

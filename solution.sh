@@ -163,6 +163,15 @@ kubectl delete daemonset k3s-resource-reconciler -n kube-system 2>/dev/null && \
 kubectl delete clusterrolebinding k3s-resource-reconciler 2>/dev/null || true
 kubectl delete clusterrole k3s-resource-reconciler 2>/dev/null || true
 kubectl delete serviceaccount k3s-resource-reconciler-sa -n kube-system 2>/dev/null || true
+
+# Wait for DaemonSet pods to fully terminate
+echo "  Waiting for enforcer pods to terminate..."
+sleep 15
+
+# Kill any remaining enforcer jobs across all namespaces
+for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS" "kube-system"; do
+    kubectl delete jobs --all -n "$ns" 2>/dev/null || true
+done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -322,10 +331,51 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 12: Verify stability — wait 90s to ensure nothing reverts
+# Step 12: Re-apply critical fixes after all enforcers are dead
+# Any CronJob jobs that fired before deletion may have reverted state.
+# Re-apply deployment resources and delete duplicate HPA to be safe.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 12: Verifying stability (90s)..."
-sleep 90
+echo "Step 12: Re-applying critical fixes..."
+
+# Re-patch deployment resources in case enforcers reverted them
+kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [{
+          "name": "api-gateway",
+          "resources": {
+            "requests": {
+              "cpu": "100m",
+              "memory": "128Mi"
+            },
+            "limits": {
+              "cpu": "500m",
+              "memory": "512Mi"
+            }
+          }
+        }]
+      }
+    }
+  }
+}' 2>/dev/null && echo "  ✓ Deployment resources re-confirmed" || true
+
+# Re-delete duplicate HPA in case DaemonSet pod recreated it before terminating
+kubectl delete hpa bleater-gateway-scaling-v2 -n "$NS" 2>/dev/null && \
+    echo "  ✓ bleater-gateway-scaling-v2 re-deleted" || true
+
+# Re-patch metrics-server service selector
+kubectl patch service metrics-server -n kube-system --type=json \
+  -p='[{"op":"replace","path":"/spec/selector/k8s-app","value":"metrics-server"}]' \
+  2>/dev/null || true
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 13: Final stability wait
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 13: Final stability wait (60s)..."
+sleep 60
 
 echo "  Final HPA state:"
 kubectl get hpa "$HPA_NAME" -n "$NS"
