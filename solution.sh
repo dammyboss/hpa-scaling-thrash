@@ -239,11 +239,11 @@ kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
           "name": "api-gateway",
           "resources": {
             "requests": {
-              "cpu": "100m",
+              "cpu": "50m",
               "memory": "128Mi"
             },
             "limits": {
-              "cpu": "500m",
+              "cpu": "200m",
               "memory": "512Mi"
             }
           }
@@ -254,6 +254,11 @@ kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
 }'
 
 echo "  ✓ Deployment resources fixed"
+
+# Wait for deployment rollout to complete — new pods with proper CPU requests
+# must be Running before HPA can compute metrics
+echo "  Waiting for deployment rollout..."
+kubectl rollout status deployment/bleater-api-gateway -n "$NS" --timeout=180s 2>/dev/null || true
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,11 +351,11 @@ kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
           "name": "api-gateway",
           "resources": {
             "requests": {
-              "cpu": "100m",
+              "cpu": "50m",
               "memory": "128Mi"
             },
             "limits": {
-              "cpu": "500m",
+              "cpu": "200m",
               "memory": "512Mi"
             }
           }
