@@ -175,11 +175,15 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 6b: Delete the duplicate conflicting HPA (subscore 8)
+# Step 6b: Delete ALL HPAs — remove duplicates and broken original
+# We'll recreate the correct HPA in Step 10. Deleting now prevents the broken
+# HPA from fighting our replica/resource changes during the rollout.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 6b: Removing duplicate HPA..."
+echo "Step 6b: Removing all HPAs..."
 kubectl delete hpa bleater-gateway-scaling-v2 -n "$NS" 2>/dev/null && \
     echo "  ✓ bleater-gateway-scaling-v2 deleted" || true
+kubectl delete hpa "$HPA_NAME" -n "$NS" 2>/dev/null && \
+    echo "  ✓ $HPA_NAME deleted (will recreate with correct config)" || true
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,10 +231,19 @@ echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 9: Fix deployment resource requests (subscore 7)
-# Set proper CPU request and limit
+# Scale to 1 replica first to reduce scheduling pressure on constrained node.
+# With HPA deleted (Step 6b), nothing will fight the scale-down.
+# After resources are fixed and 1 pod is running, the new HPA (Step 10)
+# will scale back to minReplicas.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Step 9: Fixing deployment resource requests..."
 
+# Scale to 1 to ease resource pressure during rollout
+kubectl scale deployment bleater-api-gateway -n "$NS" --replicas=1
+echo "  Scaled to 1 replica"
+sleep 10
+
+# Patch resources
 kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
   "spec": {
     "template": {
@@ -255,9 +268,8 @@ kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
 
 echo "  ✓ Deployment resources fixed"
 
-# Wait for deployment rollout to complete — new pods with proper CPU requests
-# must be Running before HPA can compute metrics
-echo "  Waiting for deployment rollout..."
+# Wait for the single pod rollout to complete
+echo "  Waiting for deployment rollout (1 replica)..."
 kubectl rollout status deployment/bleater-api-gateway -n "$NS" --timeout=180s 2>/dev/null || true
 echo ""
 
@@ -281,8 +293,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: bleater-api-gateway
-  minReplicas: 3
-  maxReplicas: 12
+  minReplicas: 2
+  maxReplicas: 10
   metrics:
   - type: Resource
     resource:
@@ -314,6 +326,18 @@ spec:
 EOF
 
 echo "  ✓ HPA patched"
+
+# Wait for HPA to scale deployment to minReplicas=2
+echo "  Waiting for deployment to reach desired replicas..."
+for i in $(seq 1 12); do
+    READY=$(kubectl get deployment bleater-api-gateway -n "$NS" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+    if [ "${READY:-0}" -ge 2 ]; then
+        echo "  ✓ Deployment has $READY ready replicas"
+        break
+    fi
+    echo "  Waiting for replicas... (ready=$READY, attempt $i/12)"
+    sleep 10
+done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
