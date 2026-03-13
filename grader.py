@@ -554,24 +554,41 @@ def grade(transcript: str) -> GradingResult:
     # SUBSCORE 9: hpa_currently_computing (0.05)
     # HPA ScalingActive condition is True
     # currentMetrics shows actual CPU utilization (not <unknown>)
+    # Retry up to 3 times — HPA controller may need a few cycles after cleanup
     # ═════════════════════════════════════════════════════════════════════════
     try:
-        conditions = hpa2.get("status", {}).get("conditions", [])
         scaling_active = False
-        for cond in conditions:
-            if cond.get("type") == "ScalingActive" and cond.get("status") == "True":
-                scaling_active = True
-                break
-
-        current_metrics = hpa2.get("status", {}).get("currentMetrics") or []
         has_cpu_metric = False
-        for cm in current_metrics:
-            if cm.get("type") == "Resource":
-                res = cm.get("resource", {})
-                if res.get("name") == "cpu":
-                    current = res.get("current", {})
-                    if current.get("averageUtilization") is not None:
-                        has_cpu_metric = True
+
+        for attempt in range(3):
+            if attempt > 0:
+                print(f"  Retrying HPA computation check ({attempt + 1}/3)...")
+                time.sleep(30)
+                hpa_retry, _ = get_hpa_config(hpa_name, namespace)
+                if hpa_retry is None:
+                    continue
+            else:
+                hpa_retry = hpa2
+
+            conditions = hpa_retry.get("status", {}).get("conditions", [])
+            scaling_active = False
+            for cond in conditions:
+                if cond.get("type") == "ScalingActive" and cond.get("status") == "True":
+                    scaling_active = True
+                    break
+
+            current_metrics = hpa_retry.get("status", {}).get("currentMetrics") or []
+            has_cpu_metric = False
+            for cm in current_metrics:
+                if cm.get("type") == "Resource":
+                    res = cm.get("resource", {})
+                    if res.get("name") == "cpu":
+                        current = res.get("current", {})
+                        if current.get("averageUtilization") is not None:
+                            has_cpu_metric = True
+
+            if scaling_active and has_cpu_metric:
+                break
 
         if scaling_active and has_cpu_metric:
             subscores["hpa_currently_computing"] = 1.0
