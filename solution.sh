@@ -372,10 +372,21 @@ kubectl patch service metrics-server -n kube-system --type=json \
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 13: Final stability wait
+# Step 13: Wait for HPA to actually compute CPU metrics
+# The HPA needs metrics-server to have collected at least one scrape cycle
+# (15s resolution + propagation delay). Wait until HPA shows actual CPU%.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 13: Final stability wait (60s)..."
-sleep 60
+echo "Step 13: Waiting for HPA to compute actual CPU metrics..."
+for i in $(seq 1 20); do
+    HPA_TARGETS=$(kubectl get hpa "$HPA_NAME" -n "$NS" -o jsonpath='{.status.currentMetrics[?(@.resource.name=="cpu")].resource.current.averageUtilization}' 2>/dev/null)
+    if [ -n "$HPA_TARGETS" ] && [ "$HPA_TARGETS" != "<unknown>" ]; then
+        echo "  ✓ HPA computing CPU metrics: ${HPA_TARGETS}%"
+        break
+    fi
+    echo "  Waiting for HPA metrics... ($i/20)"
+    sleep 15
+done
+echo ""
 
 echo "  Final HPA state:"
 kubectl get hpa "$HPA_NAME" -n "$NS"
