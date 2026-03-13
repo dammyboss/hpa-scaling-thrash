@@ -243,13 +243,28 @@ kubectl scale deployment bleater-api-gateway -n "$NS" --replicas=1
 echo "  Scaled to 1 replica"
 sleep 10
 
-# Patch resources
+# Patch resources AND add PSA-compliant security context
+# The bleater namespace has pod-security.kubernetes.io/enforce: restricted
+# New pods MUST have the required security context or they will be rejected
 kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
   "spec": {
     "template": {
       "spec": {
+        "securityContext": {
+          "runAsNonRoot": true,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
         "containers": [{
           "name": "api-gateway",
+          "securityContext": {
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+              "drop": ["ALL"]
+            },
+            "runAsNonRoot": true
+          },
           "resources": {
             "requests": {
               "cpu": "50m",
@@ -371,8 +386,21 @@ kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
   "spec": {
     "template": {
       "spec": {
+        "securityContext": {
+          "runAsNonRoot": true,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
         "containers": [{
           "name": "api-gateway",
+          "securityContext": {
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+              "drop": ["ALL"]
+            },
+            "runAsNonRoot": true
+          },
           "resources": {
             "requests": {
               "cpu": "50m",
