@@ -1,6 +1,6 @@
 #!/bin/bash
 # Solution: HPA Scaling Thrash Fix (Hard Mode)
-# Fixes all breaks across 13 subscores
+# Fixes all breaks across 5 subscores (HPA behavior, metrics pipeline, workload config, enforcement, durability)
 set -e
 export KUBECONFIG=/home/ubuntu/.kube/config
 

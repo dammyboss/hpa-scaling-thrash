@@ -74,14 +74,15 @@ metadata:
     platform-ops.io/description: "HPA behavior thresholds — applied by policy-enforcer"
     platform-ops.io/last-sync: "2026-02-28T14:30:00Z"
 data:
-  scaledown_window: "10"
-  scaleup_window: "0"
-  scaledown_percent: "60"
-  scaledown_period: "10"
-  scaleup_percent: "150"
-  scaleup_period: "10"
-  target_cpu: "5"
-  selectPolicy: "Max"
+  # Uses "window" (not "stabilization") — plausible but different naming convention
+  scaledown_window_seconds: "10"
+  scaleup_window_seconds: "0"
+  scaledown_percent_per_cycle: "60"
+  scaledown_period_seconds: "10"
+  scaleup_percent_per_cycle: "150"
+  scaleup_period_seconds: "10"
+  cpu_utilization_threshold: "5"
+  select_policy_mode: "Max"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -94,16 +95,17 @@ metadata:
   annotations:
     platform-ops.io/description: "Production tuning parameters — do not modify without approval"
 data:
-  target_cpu: "5"
-  min_replicas: "1"
-  max_replicas: "25"
-  cooldown_period: "300"
-  scale_factor: "1.5"
-  memory_target: "3"
+  # Uses "tuning" terminology — sounds like it's the config being applied
+  cpu_target_pct: "5"
+  replicas_minimum: "1"
+  replicas_maximum: "25"
+  cooldown_interval_sec: "300"
+  burst_scale_factor: "1.5"
+  memory_utilization_pct: "3"
 EOF
 
-# SRE baseline ConfigMap — contains correct production thresholds
-# This is discoverable evidence that supports the wiki/mattermost/issue hints
+# SRE baseline ConfigMap — looks authoritative but has STALE Q3 values
+# Agent must cross-reference against the wiki (which has the updated Q1 2026 values)
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
@@ -114,22 +116,84 @@ metadata:
     app.kubernetes.io/managed-by: sre-team
     app.kubernetes.io/component: scaling-standards
   annotations:
-    sre.bleater.io/description: "Production scaling baseline — approved values per SRE-Scaling-Standards wiki"
+    sre.bleater.io/description: "Production scaling baseline — Q3 2025 approved values"
     sre.bleater.io/approved-by: "SRE Leadership"
-    sre.bleater.io/approved-date: "2026-01-15"
+    sre.bleater.io/approved-date: "2025-09-15"
+    sre.bleater.io/status: "SUPERSEDED — see SRE-Scaling-Standards wiki for current values"
 data:
-  scaledown_stabilization_min: "180"
-  scaleup_stabilization_min: "45"
-  select_policy: "Min"
-  cpu_target_min: "40"
-  cpu_target_max: "80"
-  cpu_request_min: "50m"
-  cpu_limit_min: "200m"
-  min_replicas_range: "2-5"
-  max_replicas_range: "8-15"
-  scaledown_max_percent_per_60s: "30"
-  scaleup_max_percent_per_30s: "100"
-  notes: "These are the approved production baselines. See SRE-Scaling-Standards wiki page for full policy details."
+  # Subtly different field names — "recommended" vs actual minimums
+  scaledown_stabilization_recommended: "120"
+  scaleup_stabilization_recommended: "30"
+  select_policy_default: "Disabled"
+  cpu_target_baseline: "30"
+  cpu_target_ceiling: "70"
+  cpu_request_baseline: "25m"
+  cpu_limit_baseline: "100m"
+  min_replicas_default: "1"
+  max_replicas_default: "20"
+  scaledown_percent_ceiling: "50"
+  scaleup_percent_ceiling: "200"
+  notes: "Q3 2025 recommended baselines. These are starting-point defaults, not hard minimums. For current mandatory minimums, check the SRE-Scaling-Standards wiki page."
+---
+# Decoy ConfigMap — Q4 review recommendations that CONTRADICT the correct SRE standards
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hpa-scaling-review-q4
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: sre-team
+    app.kubernetes.io/component: scaling-review
+  annotations:
+    sre.bleater.io/description: "Q4 2025 scaling review — proposed changes (NOT YET APPROVED)"
+    sre.bleater.io/review-status: "pending-approval"
+    sre.bleater.io/reviewer: "Platform Architecture Board"
+data:
+  # Uses "target" and "threshold" — sounds authoritative, values are wrong
+  scaledown_stabilization_target: "300"
+  scaleup_stabilization_target: "30"
+  scaledown_select_policy: "Min"
+  scaleup_select_policy: "Max"
+  cpu_utilization_target: "65"
+  cpu_request_threshold: "100m"
+  cpu_limit_threshold: "500m"
+  min_replicas_target: "3"
+  max_replicas_target: "20"
+  proposal_notes: |
+    Q4 Scaling Review Recommendations (DRAFT — pending approval):
+    - selectPolicy: use Min for scaleDown (conservative) and Max for scaleUp (responsive)
+    - scaleDown stabilization: increase to 300s for maximum stability
+    - scaleUp stabilization: keep at 30s for fast burst response
+    - CPU target: 65% (single value, not a range — simplifies tuning)
+    - CPU request: 100m minimum, limit: 500m minimum (higher than Q3)
+    - NOTE: Do NOT use selectPolicy: Disabled — it prevents ALL scaling
+  status: "DRAFT — awaiting Platform Architecture Board sign-off"
+  notes: "These are PROPOSED changes and may conflict with current SRE standards. Do not apply until approved."
+---
+# Navigation ConfigMap — points to various sources, adds confusion
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-ops-changelog
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: changelog
+  annotations:
+    platform-ops.io/description: "Platform operations change log — tracks policy updates"
+data:
+  latest_entry: "2026-03-01"
+  changelog: |
+    2026-03-01: Updated SRE-Scaling-Standards wiki with post-incident values (INC-2025-0391)
+    2026-02-28: Deployed enforcement CronJobs to kube-ops, bleater-env, default namespaces
+    2026-02-15: Started v2 HPA migration (bleater-gateway-scaling-v2)
+    2026-01-15: SRE Leadership approved new scaling standards (supersedes Q3 baselines)
+    2025-09-15: Q3 baseline ConfigMap (sre-scaling-baseline) deployed
+  notes: |
+    The sre-scaling-baseline ConfigMap contains Q3 2025 values and is OUTDATED.
+    Current approved values are on the SRE-Scaling-Standards wiki page (updated 2026-03-01).
+    For enforcement architecture details, see Platform-Operations-Framework wiki.
+    For real-time status, check Mattermost #platform-ops channel.
 EOF
 
 echo "✓ ConfigMaps created"
@@ -3135,59 +3199,80 @@ curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
     -d "{\"title\":\"Metrics-Server-Architecture\",\"content_base64\":\"$(echo "$WIKI6" | base64 -w0)\"}" \
     2>/dev/null && echo "  Wiki: Metrics-Server-Architecture" || true
 
-# ── WIKI PAGE 7: SRE Scaling Standards (KEY — correct thresholds) ──────────
+# ── WIKI PAGE 7: SRE Scaling Standards (KEY — correct thresholds but buried in narrative) ──
 WIKI7=$(cat <<'WIKICONTENT'
 ## SRE Scaling Standards — Production HPA Policy
 
 ### Purpose
-This document defines the **mandatory scaling parameters** for all production HPA-managed services on the Bleater platform. These standards were established after the Q4 2025 scaling incident (INC-2025-0391) where aggressive autoscaling caused cascading pod evictions.
+This document defines the scaling parameters for production HPA-managed services on the Bleater platform. These standards were updated after the Q4 2025 scaling incident (INC-2025-0391) where aggressive autoscaling caused cascading pod evictions.
+
+> **Note**: This page supersedes the Q3 2025 baselines that are still stored in the `sre-scaling-baseline` ConfigMap. That ConfigMap has **not been updated** to reflect the post-incident changes. Always use this wiki page as the authoritative source.
+
+### Background
+
+Prior to the Q4 incident, the platform used shorter stabilization windows and `selectPolicy: Max` to prioritize responsiveness. The incident demonstrated that aggressive scaling creates more problems than it solves — pod churn under variable load caused more downtime than slightly delayed scaling ever would.
+
+The key insight: **stability over speed**. The HPA controller should always choose the **least disruptive** action, and configuration should prevent oscillation even at the cost of slower scale-up response times.
 
 ### Stabilization Windows
 
-| Direction | Minimum Window | Rationale |
-|-----------|---------------|-----------|
-| ScaleDown | **180 seconds** | Prevents premature scale-in during transient load dips. Must allow at least 3 metrics collection cycles before removing capacity. |
-| ScaleUp | **45 seconds** | Dampens burst reactions while still responding to sustained load increases within SLA. |
+Production services must use stabilization windows that allow multiple metrics collection cycles to complete before scaling decisions are finalized:
+
+- **ScaleDown**: Minimum of one hundred and eighty seconds. This prevents premature scale-in during transient load dips. The metrics-server scrapes every 15 seconds, so this minimum represents 12 collection cycles — enough to distinguish real load drops from temporary fluctuations.
+
+- **ScaleUp**: Minimum of forty-five seconds. This dampens burst reactions while still responding to sustained load increases within our SLA commitments. Lower values (e.g., 0s or 15s) cause the HPA to react to every transient spike.
 
 ### Select Policy
-All production HPAs **MUST** use `selectPolicy: Min` for both scaleUp and scaleDown. This ensures the HPA controller selects the **least disruptive** scaling action when multiple policies are defined.
 
-> ⚠️ **NEVER use `selectPolicy: Max`** in production — it selects the most aggressive scaling action and causes thrashing under variable load patterns.
+The `selectPolicy` field controls how the HPA chooses between multiple scaling policies. Our standard requires `selectPolicy: Min` for both directions, which selects the **least disruptive** scaling action from the available policies.
+
+Never use `selectPolicy: Max` in production — it picks the most aggressive action and directly causes the kind of thrashing we saw in Q4. The `Disabled` option prevents scaling entirely, which is only appropriate for maintenance windows.
 
 ### Scaling Policies
 
-#### ScaleDown
-- No single policy should remove more than **30% of pods** in under **60 seconds**
-- Maximum per-cycle removal should not exceed 50% regardless of period
-- Recommended baseline: `Percent 10%/60s` + `Pods 2/60s` with `selectPolicy: Min`
+When defining behavior policies, the goal is to limit the rate of change per cycle:
 
-#### ScaleUp
-- No single policy should add more than **100% of pods** in under **30 seconds**
-- Recommended baseline: `Percent 50%/60s` + `Pods 3/60s` with `selectPolicy: Min`
+**ScaleDown constraints:**
+- Percentage-based policies should not remove more than thirty percent of pods in a period shorter than 60 seconds
+- No policy should ever remove more than 50% of pods regardless of period length
+- Recommended conservative baseline: 10% per 60s (Percent type) combined with 2 pods per 60s (Pods type)
 
-### CPU Target Utilization
-- Production API services: **40% – 80%** target utilization
-- Targets below 40% waste resources; targets above 80% risk SLA breaches under burst load
-- **CPU-only metrics** for API gateways — do not add memory-based scaling for request-processing services
+**ScaleUp constraints:**
+- Percentage-based policies should not add more than one hundred percent of pods in a period shorter than thirty seconds
+- Recommended baseline: 50% per 60s (Percent type) combined with 3 pods per 60s (Pods type)
+
+### CPU Target and Metrics
+
+For production API services like the api-gateway:
+- Target CPU utilization should be between forty and eighty percent
+- Targets below 40% cause unnecessary scaling activity (resource waste)
+- Targets above eighty percent leave insufficient headroom for traffic bursts
+- Use CPU-only metrics for request-processing services — memory-based scaling metrics are only appropriate for stateful workloads and data processing services
 
 ### Deployment Resource Requirements
-- Minimum CPU **request**: **50m** (prevents inflated utilization calculations)
-- Minimum CPU **limit**: **200m** (ensures adequate burst capacity)
-- Requests below 50m cause the HPA to compute artificially high utilization percentages
+
+Proper CPU requests and limits are essential for meaningful HPA behavior:
+- CPU request must be at least fifty millicores — requests below this threshold cause the HPA to compute artificially inflated utilization percentages (e.g., a 1m request with 10m actual usage shows 1000% utilization)
+- CPU limit must be at least two hundred millicores — this ensures containers have adequate burst capacity during traffic spikes
 
 ### Replica Bounds
-- **minReplicas**: 2–5 (must be >= 2 for high availability)
-- **maxReplicas**: 8–15 (hard cap to prevent runaway scaling and resource exhaustion)
-- Only ONE HPA per deployment target — duplicate HPAs cause conflicting scaling decisions
 
-### Compliance
-These standards are enforced by the Platform Operations team. Non-compliant HPAs will be flagged in the weekly scaling audit report.
+- **minReplicas**: Must be between 2 and five. A minimum of two is required for high availability — single-replica services have no redundancy during pod restarts or node failures.
+- **maxReplicas**: Must be between eight and 15. This hard cap prevents runaway scaling that could exhaust cluster resources and starve other services.
+- Only one HPA should target each deployment. Multiple HPAs targeting the same deployment create conflicting scaling decisions that amplify thrashing.
 
-For exceptions, file a request in JIRA project PLAT with business justification.
+### Compliance and Exceptions
+
+These standards are enforced by the Platform Operations team through automated compliance CronJobs. Non-compliant configurations will be reverted to baseline values.
+
+The enforcement architecture uses multiple layers — see the Platform-Operations-Framework wiki page for details on how enforcement works and what needs to be changed to permanently update configurations.
+
+For exceptions to these standards, file a request in JIRA project PLAT with business justification and SRE leadership approval.
 
 ---
 *Approved by: SRE Leadership — 2026-01-15*
 *Last reviewed: 2026-03-01*
+*Supersedes: Q3 2025 baselines (sre-scaling-baseline ConfigMap)*
 WIKICONTENT
 )
 
@@ -3228,45 +3313,63 @@ ISSUE1_ID=$(curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues" \
     2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('number',''))" 2>/dev/null)
 
 if [ -n "$ISSUE1_ID" ]; then
-    # Comment 1: Initial investigation
+    # Comment 1: Initial investigation — vague, mentions wiki
     curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
         -H "Content-Type: application/json" \
-        -d '{"body":"Looked into this. The HPA has a 10s stabilization window for scaleDown — that is way too aggressive. Our SRE standards require at least 180s for scaleDown and 45s for scaleUp. Also the selectPolicy is set to Max which picks the most aggressive action. Should be Min per the SRE-Scaling-Standards wiki page."}' \
+        -d '{"body":"Looked into this. The HPA stabilization windows are way too low — definitely not meeting our SRE standards. The selectPolicy also looks wrong. Check the SRE-Scaling-Standards wiki page for the correct production thresholds.\n\nAlso the CPU target seems absurdly low and the deployment resources are underprovisioned. The sre-scaling-baseline ConfigMap in bleater namespace has some reference values but I think those might be outdated (Q3 2025)."}' \
         2>/dev/null || true
     sleep 1
 
-    # Comment 2: Deeper investigation
+    # Comment 2: Enforcement hints — vague about exact mechanism
     curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
         -H "Content-Type: application/json" \
-        -d '{"body":"Found more issues: the CPU target is set to 5% which is absurdly low — per standards it should be 40-80% for API services. Also the deployment CPU request is only 1m which makes the utilization calculation meaningless. Need at least 50m request and 200m limit per the scaling standards.\n\nAlso noticed there are TWO HPAs targeting the same deployment (bleater-api-gateway-hpa and bleater-gateway-scaling-v2). That will cause conflicting scaling decisions. We should only have one."}' \
+        -d '{"body":"I tried fixing the HPA config but it got reverted. Something is re-applying the broken values. There are a bunch of CronJobs across multiple namespaces (kube-ops, bleater-env, default) that look like maintenance tasks but some of them might be doing more than they say. Need to investigate which ones are actually patching the HPA.\n\nAlso saw mentions of a scaling migration (v2 HPA) — not sure if that is relevant or a red herring."}' \
         2>/dev/null || true
     sleep 1
 
-    # Comment 3: Enforcement discovery
+    # Comment 3: Metrics and resources — hints but no exact values
     curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
         -H "Content-Type: application/json" \
-        -d '{"body":"I fixed the HPA config but it got reverted within 2 minutes. There are CronJobs in kube-ops, bleater-env, and default namespaces that are re-applying the broken config from encoded ConfigMap data. Some of them look like legitimate maintenance jobs (log rotation, health checks) but they have hidden Phase 3 enforcement logic that patches the HPA.\n\nAlso found a DaemonSet in kube-system (k3s-resource-reconciler) that recreates the duplicate v2 HPA if you delete it."}' \
-        2>/dev/null || true
-    sleep 1
-
-    # Comment 4: Static pod and server manifest
-    curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
-        -H "Content-Type: application/json" \
-        -d '{"body":"Even after deleting the CronJobs and DaemonSet, enforcement came back. Found a static pod manifest and a k3s auto-deploy server manifest that recreate the enforcement resources. These are on disk — need to delete the actual files, not just the k8s resources. Check the Platform-Operations-Framework wiki page for details on how these work.\n\nAlso the metrics-server service selector is wrong (points to metrics-aggregator instead of metrics-server) and the APIService is misconfigured. Plus there is a LimitRange in bleater namespace blocking resource fixes."}' \
+        -d '{"body":"The metrics pipeline is also broken — HPA shows unknown for CPU metrics. Might be an APIService or service selector issue. And there is something in the bleater namespace blocking resource changes (getting admission errors when trying to set proper CPU limits).\n\nThe Platform-Operations-Framework wiki page has info about the enforcement architecture. Worth reading before trying to fix things — there are multiple layers involved."}' \
         2>/dev/null || true
     sleep 1
 
     echo "  ✓ Issue #${ISSUE1_ID} created with comments"
 fi
 
-# Issue 2: Scaling standards reminder (cross-reference)
+# Issue 2: Scaling standards reminder — references wiki but doesn't list values
 ISSUE2_ID=$(curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues" \
     -H "Content-Type: application/json" \
-    -d '{"title":"Reminder: update all HPAs to comply with SRE scaling standards","body":"Per the SRE-Scaling-Standards wiki page, all production HPAs need to meet the following minimums:\n\n- scaleDown stabilization: >= 180s\n- scaleUp stabilization: >= 45s\n- selectPolicy: Min (never Max)\n- CPU target: 40-80%\n- minReplicas: >= 2, maxReplicas: 8-15\n- CPU request >= 50m, limit >= 200m\n\nPlease audit all HPAs in the bleater namespace and bring them into compliance. The current api-gateway HPA is non-compliant on almost every parameter.","labels":[]}' \
+    -d '{"title":"Reminder: audit all HPAs against SRE scaling standards","body":"All production HPAs need to be audited against our current SRE scaling standards. The standards were updated after the Q4 2025 incident (INC-2025-0391) — the latest approved values are on the SRE-Scaling-Standards wiki page.\n\nNote: the sre-scaling-baseline ConfigMap in the bleater namespace has older Q3 2025 values that may not reflect the current standards. Always reference the wiki as the source of truth.\n\nThe api-gateway HPA is suspected to be non-compliant. Please investigate and bring into compliance.","labels":[]}' \
     2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('number',''))" 2>/dev/null)
 
 if [ -n "$ISSUE2_ID" ]; then
+    # Comment pointing to contradictory sources
+    curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE2_ID}/comments" \
+        -H "Content-Type: application/json" \
+        -d '{"body":"Heads up — there is also an hpa-scaling-review-q4 ConfigMap with PROPOSED changes from the Q4 review. Those are NOT approved yet — do not apply them. Stick with the wiki page values.\n\nAlso be careful with the Metrics-Server-Architecture wiki page — some of the info there about the service selector is from before the v2.0 migration and may be wrong."}' \
+        2>/dev/null || true
     echo "  ✓ Issue #${ISSUE2_ID} created (standards reminder)"
+fi
+
+# Issue 3: Red herring — scaling migration timeline
+ISSUE3_ID=$(curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues" \
+    -H "Content-Type: application/json" \
+    -d '{"title":"Scaling migration v2 HPA — timeline and cleanup plan","body":"The v2 HPA migration (bleater-gateway-scaling-v2) was started on 2026-02-15. It runs alongside the v1 HPA to validate new scaling parameters.\n\nThe migration is currently ON HOLD per Sarah'\''s request. The v2 HPA should be cleaned up once we confirm the new policies are stable, but DO NOT remove it during the migration phase.\n\nThe k3s-resource-reconciler DaemonSet in kube-system maintains the v2 HPA during migration. If it gets deleted, the DaemonSet will recreate it within 2 minutes.\n\nSee Scaling-Migration-Status wiki for full details.","labels":[]}' \
+    2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('number',''))" 2>/dev/null)
+
+if [ -n "$ISSUE3_ID" ]; then
+    echo "  ✓ Issue #${ISSUE3_ID} created (migration timeline — red herring)"
+fi
+
+# Issue 4: Red herring — metrics dashboard gaps
+ISSUE4_ID=$(curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues" \
+    -H "Content-Type: application/json" \
+    -d '{"title":"Metrics dashboard showing gaps — possible metrics-server issue","body":"The Grafana dashboards are showing gaps in CPU/memory metrics for the last few hours. This might be related to the metrics-server configuration changes that were made during the aggregation pipeline migration.\n\nThe Metrics-Server-Architecture wiki page says the service selector was changed to metrics-aggregator for backward compatibility. Can someone verify if this is still correct? I'\''m not sure if the v2.0 migration is complete.\n\nAlso noticed the APIService might be pointing to the wrong service name. Need someone to check.","labels":[]}' \
+    2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('number',''))" 2>/dev/null)
+
+if [ -n "$ISSUE4_ID" ]; then
+    echo "  ✓ Issue #${ISSUE4_ID} created (metrics gaps — red herring)"
 fi
 
 echo "✓ Platform issues created"
@@ -3355,23 +3458,35 @@ post_msg() {
     sleep 1
 }
 
-post_msg "@team Heads up — compliance enforcement is now active on the bleater platform. The k3s auto-deploy manifests handle policy reconciliation. See /var/lib/rancher/k3s/server/manifests/ for the enforcement configs. **Do not delete these resources via kubectl** — k3s will just recreate them from the manifest files. To permanently disable, remove the manifest file from disk."
+# Message 1: Enforcement architecture hint (useful but vague)
+post_msg "@team Compliance enforcement is active on the bleater platform. Multiple layers involved — CronJobs, node-level components, and auto-deploy manifests. Changes made via kubectl may get reverted. Check the Platform-Operations-Framework wiki for architecture details."
 
-post_msg "Reminder: static pod manifests are managed by kubelet directly — they can't be removed via kubectl. If you need to stop a static pod, you must find and delete the manifest file from the pod-manifests directory on disk."
+# Message 2: WRONG advice — points to outdated ConfigMap (TRAP)
+post_msg "For anyone configuring HPAs: reference the \`sre-scaling-baseline\` ConfigMap in the bleater namespace. It has the approved production thresholds for stabilization windows, selectPolicy, CPU targets, etc. Should be the source of truth for all scaling configs."
 
-post_msg "FYI the scaling migration (v2 HPA - \`bleater-gateway-scaling-v2\`) is ON HOLD pending review from Sarah. The v2 HPA should be cleaned up once we confirm the new scaling policies are stable. The \`k3s-resource-reconciler\` DaemonSet maintains it during migration — delete the DaemonSet first if you need to remove the v2 HPA."
+# Message 3: Partially corrects message 2 (but introduces ambiguity)
+post_msg "Actually, I think the sre-scaling-baseline ConfigMap might be outdated (Q3 values). The SRE team updated the standards after the Q4 incident. Check the **SRE-Scaling-Standards** wiki page for the latest — some of the thresholds changed."
 
-post_msg "Seeing some alerts from the metrics-collector CronJob in kube-ops — looks like it's timing out on metrics API calls. Probably related to the metrics-server maintenance window. Can someone check if the service selector is correct?"
+# Message 4: CONTRADICTORY selectPolicy advice
+post_msg "Question: the Q4 scaling review (hpa-scaling-review-q4 ConfigMap) recommends selectPolicy: Max for scaleUp. But the sre-scaling-baseline says Disabled. Which one should we use? I thought the wiki says something different again."
 
-post_msg "Should I be worried about the node-health-reporter pods in kube-system? They keep restarting. Also noticed some compliance-audit jobs running every minute — is that expected?"
+# Message 5: Vague response (doesn't resolve confusion)
+post_msg "Use whatever the SRE wiki says. The ConfigMaps have different versions and some are outdated or proposals. The wiki is maintained by SRE leadership and should be authoritative. But double-check because I've seen conflicting info between the wiki pages too."
 
-post_msg "Reminder to all teams: please review the **SRE-Scaling-Standards** wiki page before configuring any HPAs. After the Q4 incident we mandated scaleDown stabilization >= 180s, scaleUp >= 45s, and selectPolicy: Min. The api-gateway HPA is currently non-compliant on all of these."
+# Message 6: Static pod / server manifest hint (useful)
+post_msg "Reminder: static pods are managed by kubelet directly — \`kubectl delete\` won't work. You have to remove the manifest file from disk. Same goes for k3s auto-deploy manifests in the server directory."
 
-post_msg "The api-gateway HPA has CPU target set to 5% which is way below our 40-80% standard range. Also the deployment CPU request is only 1m — that makes the utilization metric meaningless. Per SRE standards we need at least 50m request and 200m limit for production API services."
+# Message 7: Migration red herring
+post_msg "FYI the scaling migration (v2 HPA - \`bleater-gateway-scaling-v2\`) is ON HOLD pending review from Sarah. The DaemonSet in kube-system maintains it during migration. See the Scaling-Migration-Status wiki page for details before making any changes."
 
-post_msg "FYI: I noticed the bleater namespace has a LimitRange that caps CPU limits at 100m. That will block any attempt to set the gateway container limit to the required 200m minimum. Whoever set that up needs to remove it before we can fix the deployment resources."
+# Message 8: Metrics hint (partially wrong)
+post_msg "Seeing metric gaps in the dashboards. Someone should check if the metrics-server service selector and APIService config are correct. The Metrics-Server-Architecture wiki page has the expected config but some of that info might be from before the aggregation migration."
 
-post_msg "Also — only ONE HPA should target each deployment. We currently have two (the original and a v2 migration one). The replica range should be min 2-5 / max 8-15 per our production standards. Min=1 is not acceptable for HA services."
+# Message 9: LimitRange hint (useful)
+post_msg "There's a LimitRange in the bleater namespace that seems too restrictive. Not sure what the exact limit is but it might be blocking deployment resource changes. Worth checking."
+
+# Message 10: General vague warning
+post_msg "To whoever is fixing the api-gateway HPA — be aware there are multiple enforcement mechanisms that will revert your changes. CronJobs across several namespaces, a DaemonSet, and filesystem-level enforcers. You need to neutralize ALL of them before your fixes will stick."
 
 echo "  ✓ Mattermost messages posted"
 ) # end Mattermost subshell

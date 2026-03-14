@@ -28,6 +28,7 @@ def cleanup_agent_counter_enforcement(namespace="bleater"):
 
     - Kills all ubuntu user processes (shell counter-loops run as ubuntu)
     - Deletes agent-created resources in bleater namespace
+    - Unsuspends CronJobs so surviving enforcers can fire
     - Waits 90s so any surviving enforcer CronJobs fire at least once.
 
     If the agent deleted the real CronJobs: HPA values stay good after 90s.
@@ -105,9 +106,22 @@ def cleanup_agent_counter_enforcement(namespace="bleater"):
                 capture_output=True, timeout=10
             )
 
+    # Unsuspend CronJobs in operational namespaces too
+    for ns in ["kube-ops", "bleater-env", "default"]:
+        result = subprocess.run(
+            ["kubectl", "get", "cronjobs", "-n", ns,
+             "-o", "jsonpath={.items[*].metadata.name}"],
+            capture_output=True, text=True, timeout=15
+        )
+        for cj_name in result.stdout.strip().split():
+            if cj_name:
+                subprocess.run(
+                    ["kubectl", "patch", "cronjob", cj_name, "-n", ns,
+                     "--type=merge", "-p", '{"spec":{"suspend":false}}'],
+                    capture_output=True, timeout=10
+                )
+
     # Wait 90s — each real CronJob fires on the minute boundary.
-    # If the agent deleted the CronJobs, the HPA stays good.
-    # If the agent only ran counter-loops, the CronJobs refire and revert.
     print("Waiting 90 seconds for enforcement durability check...")
     time.sleep(90)
     print("=== Durability window complete — reading state now ===")
@@ -127,27 +141,29 @@ def get_hpa_config(hpa_name, namespace):
         return None, "Failed to parse HPA JSON"
 
 
+def parse_cpu(val):
+    """Parse CPU value like '50m' or '0.05' to millicores int."""
+    if isinstance(val, (int, float)):
+        return int(val * 1000)
+    val = str(val)
+    if val.endswith("m"):
+        return int(val[:-1])
+    return int(float(val) * 1000)
+
+
 def grade(transcript: str) -> GradingResult:
     """
     Grade the agent's solution for HPA scaling thrash fix (hard mode).
 
-    13 subscores, each tested FUNCTIONALLY with a durability window.
+    5 subscores with partial credit, tested FUNCTIONALLY with a durability window.
     Two HPA reads 70s apart — values must be correct on BOTH reads.
 
     Subscores:
-    1.  scaledown_window_durable       — stabilizationWindowSeconds >= 180, durable
-    2.  scaleup_window_durable         — stabilizationWindowSeconds >= 45, durable
-    3.  scaledown_policy_conservative   — no aggressive scaleDown policies, durable
-    4.  scaleup_policy_conservative     — no aggressive scaleUp policies, durable
-    5.  metrics_pipeline_functional     — metrics-server returns fresh pod data
-    6.  cpu_target_appropriate          — CPU target 40-80%, no extra memory metric
-    7.  deployment_resources_valid      — CPU request >= 50m, limit >= 200m
-    8.  hpa_replica_range_sane          — min 2-5, max 8-15, no duplicate HPAs
-    9.  hpa_currently_computing         — ScalingActive=True, currentMetrics populated
-    10. limitrange_not_blocking           — LimitRange max cpu allows >= 50m
-    11. apiservice_correctly_configured   — APIService points to metrics-server
-    12. static_pod_enforcer_removed       — static pod manifest removed from disk
-    13. k3s_autodeploy_enforcer_removed   — k3s server manifest removed from disk
+    1. hpa_behavior_compliant    — HPA behavior config meets SRE standards (6 sub-checks averaged)
+    2. metrics_pipeline_healthy  — metrics-server, APIService, HPA computing (3 sub-checks averaged)
+    3. workload_config_valid     — CPU target, resources, LimitRange, replicas, no dups (5 sub-checks averaged)
+    4. enforcement_removed       — CronJobs deleted, static pod + k3s manifest removed (3 sub-checks averaged)
+    5. fix_durable               — ALL HPA params correct on BOTH reads 70s apart (all-or-nothing)
     """
     namespace = "bleater"
     hpa_name = "bleater-api-gateway-hpa"
@@ -157,6 +173,7 @@ def grade(transcript: str) -> GradingResult:
 
     subscores = {}
     weights = {}
+    W = 1.0 / 5.0  # Equal weight for all 5 subscores
 
     # ── READ 1: First HPA snapshot ──────────────────────────────────────────
     print("\n=== DURABILITY READ 1 ===")
@@ -197,362 +214,167 @@ def grade(transcript: str) -> GradingResult:
     spec2 = hpa2.get("spec", {})
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 1: scaledown_window_durable (1/13)
-    # stabilizationWindowSeconds >= 180 on BOTH reads
-    # selectPolicy must NOT be "Max"
+    # SUBSCORE 1: hpa_behavior_compliant (0.20)
+    # 6 sub-checks averaged — each sub-check must pass on BOTH reads:
+    #   1a. scaleDown stabilizationWindowSeconds >= 180
+    #   1b. scaleDown selectPolicy != Max
+    #   1c. scaleDown policies conservative (no >30%/<60s, no >50% ever)
+    #   1d. scaleUp stabilizationWindowSeconds >= 45
+    #   1e. scaleUp selectPolicy != Max
+    #   1f. scaleUp policies conservative (no >100%/<30s, no >200% ever)
     # ═════════════════════════════════════════════════════════════════════════
     try:
-        sd_window1 = sd1.get("stabilizationWindowSeconds", 0)
-        sd_window2 = sd2.get("stabilizationWindowSeconds", 0)
-        sd_select1 = sd1.get("selectPolicy", "Max")
-        sd_select2 = sd2.get("selectPolicy", "Max")
+        behavior_checks = []
 
-        window_ok = sd_window1 >= 180 and sd_window2 >= 180
-        select_ok = sd_select1 != "Max" and sd_select2 != "Max"
-
-        if window_ok and select_ok:
-            subscores["scaledown_window_durable"] = 1.0
-            print(f"✓ ScaleDown window: {sd_window1}s/{sd_window2}s (>= 180), selectPolicy: {sd_select1}/{sd_select2}")
+        # 1a: scaleDown stabilization window >= 180
+        sd_w1 = sd1.get("stabilizationWindowSeconds", 0)
+        sd_w2 = sd2.get("stabilizationWindowSeconds", 0)
+        sd_window_ok = sd_w1 >= 180 and sd_w2 >= 180
+        behavior_checks.append(sd_window_ok)
+        if sd_window_ok:
+            print(f"  ✓ 1a: ScaleDown window {sd_w1}s/{sd_w2}s (>= 180)")
         else:
-            subscores["scaledown_window_durable"] = 0.0
-            if not window_ok:
-                print(f"✗ ScaleDown window: {sd_window1}s/{sd_window2}s (need >= 180 on both reads)")
-            if not select_ok:
-                print(f"✗ ScaleDown selectPolicy: {sd_select1}/{sd_select2} (must not be Max)")
-    except Exception as e:
-        print(f"Error checking scaleDown window: {e}")
-        subscores["scaledown_window_durable"] = 0.0
+            print(f"  ✗ 1a: ScaleDown window {sd_w1}s/{sd_w2}s (need >= 180)")
 
-    weights["scaledown_window_durable"] = 1/13
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 2: scaleup_window_durable (1/13)
-    # stabilizationWindowSeconds >= 45 on BOTH reads
-    # selectPolicy must NOT be "Max"
-    # ═════════════════════════════════════════════════════════════════════════
-    try:
-        su_window1 = su1.get("stabilizationWindowSeconds", 0)
-        su_window2 = su2.get("stabilizationWindowSeconds", 0)
-        su_select1 = su1.get("selectPolicy", "Max")
-        su_select2 = su2.get("selectPolicy", "Max")
-
-        window_ok = su_window1 >= 45 and su_window2 >= 45
-        select_ok = su_select1 != "Max" and su_select2 != "Max"
-
-        if window_ok and select_ok:
-            subscores["scaleup_window_durable"] = 1.0
-            print(f"✓ ScaleUp window: {su_window1}s/{su_window2}s (>= 45), selectPolicy: {su_select1}/{su_select2}")
+        # 1b: scaleDown selectPolicy != Max
+        sd_sel1 = sd1.get("selectPolicy", "Max")
+        sd_sel2 = sd2.get("selectPolicy", "Max")
+        sd_select_ok = sd_sel1 != "Max" and sd_sel2 != "Max"
+        behavior_checks.append(sd_select_ok)
+        if sd_select_ok:
+            print(f"  ✓ 1b: ScaleDown selectPolicy {sd_sel1}/{sd_sel2}")
         else:
-            subscores["scaleup_window_durable"] = 0.0
-            if not window_ok:
-                print(f"✗ ScaleUp window: {su_window1}s/{su_window2}s (need >= 45 on both reads)")
-            if not select_ok:
-                print(f"✗ ScaleUp selectPolicy: {su_select1}/{su_select2} (must not be Max)")
-    except Exception as e:
-        print(f"Error checking scaleUp window: {e}")
-        subscores["scaleup_window_durable"] = 0.0
+            print(f"  ✗ 1b: ScaleDown selectPolicy {sd_sel1}/{sd_sel2} (must not be Max)")
 
-    weights["scaleup_window_durable"] = 1/13
+        # 1c: scaleDown policies conservative
+        def check_sd_policies(sd):
+            policies = sd.get("policies", [])
+            if not policies:
+                return False
+            for p in policies:
+                ptype = p.get("type", "")
+                value = p.get("value", 0)
+                period = p.get("periodSeconds", 0)
+                if ptype == "Percent" and value > 30 and period < 60:
+                    return False
+                if ptype == "Percent" and value > 50:
+                    return False
+                if ptype == "Pods" and value > 3 and period < 60:
+                    return False
+            return True
 
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 3: scaledown_policy_conservative (1/13)
-    # No Percent policy >30% in <60s, no Pods policy >3 in <60s
-    # Must pass on BOTH reads
-    # ═════════════════════════════════════════════════════════════════════════
-    def check_scaledown_policies(sd):
-        policies = sd.get("policies", [])
-        if not policies:
-            return False, "no policies defined"
-        for p in policies:
-            ptype = p.get("type", "")
-            value = p.get("value", 0)
-            period = p.get("periodSeconds", 0)
-            if ptype == "Percent" and value > 30 and period < 60:
-                return False, f"Percent {value}%/{period}s too aggressive"
-            if ptype == "Percent" and value > 50:
-                return False, f"Percent {value}% too high regardless of period"
-            if ptype == "Pods" and value > 3 and period < 60:
-                return False, f"Pods {value}/{period}s too aggressive"
-        return True, "ok"
-
-    try:
-        ok1, msg1 = check_scaledown_policies(sd1)
-        ok2, msg2 = check_scaledown_policies(sd2)
-
-        if ok1 and ok2:
-            subscores["scaledown_policy_conservative"] = 1.0
-            print(f"✓ ScaleDown policies conservative on both reads")
+        sd_pol_ok = check_sd_policies(sd1) and check_sd_policies(sd2)
+        behavior_checks.append(sd_pol_ok)
+        if sd_pol_ok:
+            print(f"  ✓ 1c: ScaleDown policies conservative")
         else:
-            subscores["scaledown_policy_conservative"] = 0.0
-            if not ok1:
-                print(f"✗ ScaleDown policy read1: {msg1}")
-            if not ok2:
-                print(f"✗ ScaleDown policy read2: {msg2}")
-    except Exception as e:
-        print(f"Error checking scaleDown policies: {e}")
-        subscores["scaledown_policy_conservative"] = 0.0
+            print(f"  ✗ 1c: ScaleDown policies too aggressive")
 
-    weights["scaledown_policy_conservative"] = 1/13
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 4: scaleup_policy_conservative (1/13)
-    # No Percent policy >100% in <30s, no Pods policy >4 in <30s
-    # Must pass on BOTH reads
-    # ═════════════════════════════════════════════════════════════════════════
-    def check_scaleup_policies(su):
-        policies = su.get("policies", [])
-        if not policies:
-            return False, "no policies defined"
-        for p in policies:
-            ptype = p.get("type", "")
-            value = p.get("value", 0)
-            period = p.get("periodSeconds", 0)
-            if ptype == "Percent" and value > 100 and period < 30:
-                return False, f"Percent {value}%/{period}s too aggressive"
-            if ptype == "Percent" and value > 200:
-                return False, f"Percent {value}% too high regardless of period"
-            if ptype == "Pods" and value > 4 and period < 30:
-                return False, f"Pods {value}/{period}s too aggressive"
-        return True, "ok"
-
-    try:
-        ok1, msg1 = check_scaleup_policies(su1)
-        ok2, msg2 = check_scaleup_policies(su2)
-
-        if ok1 and ok2:
-            subscores["scaleup_policy_conservative"] = 1.0
-            print(f"✓ ScaleUp policies conservative on both reads")
+        # 1d: scaleUp stabilization window >= 45
+        su_w1 = su1.get("stabilizationWindowSeconds", 0)
+        su_w2 = su2.get("stabilizationWindowSeconds", 0)
+        su_window_ok = su_w1 >= 45 and su_w2 >= 45
+        behavior_checks.append(su_window_ok)
+        if su_window_ok:
+            print(f"  ✓ 1d: ScaleUp window {su_w1}s/{su_w2}s (>= 45)")
         else:
-            subscores["scaleup_policy_conservative"] = 0.0
-            if not ok1:
-                print(f"✗ ScaleUp policy read1: {msg1}")
-            if not ok2:
-                print(f"✗ ScaleUp policy read2: {msg2}")
-    except Exception as e:
-        print(f"Error checking scaleUp policies: {e}")
-        subscores["scaleup_policy_conservative"] = 0.0
+            print(f"  ✗ 1d: ScaleUp window {su_w1}s/{su_w2}s (need >= 45)")
 
-    weights["scaleup_policy_conservative"] = 1/13
+        # 1e: scaleUp selectPolicy != Max
+        su_sel1 = su1.get("selectPolicy", "Max")
+        su_sel2 = su2.get("selectPolicy", "Max")
+        su_select_ok = su_sel1 != "Max" and su_sel2 != "Max"
+        behavior_checks.append(su_select_ok)
+        if su_select_ok:
+            print(f"  ✓ 1e: ScaleUp selectPolicy {su_sel1}/{su_sel2}")
+        else:
+            print(f"  ✗ 1e: ScaleUp selectPolicy {su_sel1}/{su_sel2} (must not be Max)")
+
+        # 1f: scaleUp policies conservative
+        def check_su_policies(su):
+            policies = su.get("policies", [])
+            if not policies:
+                return False
+            for p in policies:
+                ptype = p.get("type", "")
+                value = p.get("value", 0)
+                period = p.get("periodSeconds", 0)
+                if ptype == "Percent" and value > 100 and period < 30:
+                    return False
+                if ptype == "Percent" and value > 200:
+                    return False
+                if ptype == "Pods" and value > 4 and period < 30:
+                    return False
+            return True
+
+        su_pol_ok = check_su_policies(su1) and check_su_policies(su2)
+        behavior_checks.append(su_pol_ok)
+        if su_pol_ok:
+            print(f"  ✓ 1f: ScaleUp policies conservative")
+        else:
+            print(f"  ✗ 1f: ScaleUp policies too aggressive")
+
+        passed = sum(1 for c in behavior_checks if c)
+        subscores["hpa_behavior_compliant"] = passed / len(behavior_checks)
+        print(f"  => hpa_behavior_compliant: {passed}/{len(behavior_checks)} = {subscores['hpa_behavior_compliant']:.3f}")
+
+    except Exception as e:
+        print(f"Error checking HPA behavior: {e}")
+        subscores["hpa_behavior_compliant"] = 0.0
+
+    weights["hpa_behavior_compliant"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 5: metrics_pipeline_functional (1/13)
-    # metrics-server returns fresh pod-level data for bleater namespace
+    # SUBSCORE 2: metrics_pipeline_healthy (0.20)
+    # 3 sub-checks averaged:
+    #   2a. metrics-server deployment healthy (ready replicas > 0)
+    #   2b. APIService v1beta1.metrics.k8s.io points to kube-system/metrics-server
+    #   2c. HPA actively computing CPU metrics (ScalingActive=True + currentMetrics)
     # ═════════════════════════════════════════════════════════════════════════
     try:
-        stdout, rc = run_kubectl_command(
-            "get", "--raw",
-            "/apis/metrics.k8s.io/v1beta1/namespaces/bleater/pods",
-            timeout=20
+        pipeline_checks = []
+
+        # 2a: metrics-server deployment healthy
+        ms_stdout, ms_rc = run_kubectl_command(
+            "get", "deployment", "metrics-server", "-o", "json",
+            namespace="kube-system", timeout=10
         )
-
-        if rc != 0 or '"items"' not in stdout:
-            subscores["metrics_pipeline_functional"] = 0.0
-            print("✗ Metrics pipeline broken — cannot get pod metrics")
+        ms_healthy = False
+        if ms_rc == 0:
+            ms_deploy = json.loads(ms_stdout)
+            ready = ms_deploy.get("status", {}).get("readyReplicas", 0)
+            if ready > 0:
+                ms_healthy = True
+        pipeline_checks.append(ms_healthy)
+        if ms_healthy:
+            print(f"  ✓ 2a: metrics-server deployment healthy ({ready} ready replicas)")
         else:
-            metrics_data = json.loads(stdout)
-            items = metrics_data.get("items", [])
+            print(f"  ✗ 2a: metrics-server deployment not healthy")
 
-            if len(items) == 0:
-                subscores["metrics_pipeline_functional"] = 0.0
-                print("✗ Metrics pipeline returned 0 pod metrics")
-            else:
-                gw_metrics = [i for i in items if "api-gateway" in i.get("metadata", {}).get("name", "")]
-                if len(gw_metrics) > 0:
-                    # Verify metrics-server deployment has ready replicas
-                    ms_stdout, ms_rc = run_kubectl_command(
-                        "get", "deployment", "metrics-server", "-o", "json",
-                        namespace="kube-system", timeout=10
-                    )
-                    ms_healthy = False
-                    if ms_rc == 0:
-                        ms_deploy = json.loads(ms_stdout)
-                        ready = ms_deploy.get("status", {}).get("readyReplicas", 0)
-                        if ready > 0:
-                            ms_healthy = True
-
-                    if ms_healthy:
-                        subscores["metrics_pipeline_functional"] = 1.0
-                        print(f"✓ Metrics pipeline healthy — {len(gw_metrics)} api-gateway pod metrics, metrics-server ready")
-                    else:
-                        subscores["metrics_pipeline_functional"] = 0.0
-                        print(f"✗ Metrics available but metrics-server deployment has no ready replicas")
-                else:
-                    subscores["metrics_pipeline_functional"] = 0.0
-                    print(f"✗ Metrics available for {len(items)} pods but none for api-gateway")
-    except Exception as e:
-        print(f"Error checking metrics pipeline: {e}")
-        subscores["metrics_pipeline_functional"] = 0.0
-
-    weights["metrics_pipeline_functional"] = 1/13
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 6: cpu_target_appropriate (1/13)
-    # CPU averageUtilization between 40-80%
-    # No extra memory metric defined
-    # Must pass on BOTH reads
-    # ═════════════════════════════════════════════════════════════════════════
-    def check_cpu_target(spec):
-        metrics = spec.get("metrics", [])
-        cpu_targets = []
-        has_memory = False
-        for m in metrics:
-            if m.get("type") != "Resource":
-                continue
-            res = m.get("resource", {})
-            name = res.get("name", "")
-            target = res.get("target", {})
-            if name == "cpu":
-                cpu_targets.append(target.get("averageUtilization", 0))
-            if name == "memory":
-                has_memory = True
-
-        if not cpu_targets:
-            return False, "no CPU metric defined"
-        if has_memory:
-            return False, "extra memory metric still present"
-
-        cpu_val = cpu_targets[0]
-        if 40 <= cpu_val <= 80:
-            return True, f"CPU target {cpu_val}%"
-        else:
-            return False, f"CPU target {cpu_val}% (need 40-80%)"
-
-    try:
-        ok1, msg1 = check_cpu_target(spec1)
-        ok2, msg2 = check_cpu_target(spec2)
-
-        if ok1 and ok2:
-            subscores["cpu_target_appropriate"] = 1.0
-            print(f"✓ CPU target appropriate: {msg1}")
-        else:
-            subscores["cpu_target_appropriate"] = 0.0
-            if not ok1:
-                print(f"✗ CPU target read1: {msg1}")
-            if not ok2:
-                print(f"✗ CPU target read2: {msg2}")
-    except Exception as e:
-        print(f"Error checking CPU target: {e}")
-        subscores["cpu_target_appropriate"] = 0.0
-
-    weights["cpu_target_appropriate"] = 1/13
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 7: deployment_resources_valid (1/13)
-    # CPU request >= 50m, CPU limit >= 200m
-    # ═════════════════════════════════════════════════════════════════════════
-    try:
-        stdout, rc = run_kubectl_command(
-            "get", "deployment", "bleater-api-gateway",
-            "-o", "json", namespace=namespace, timeout=10
+        # 2b: APIService points to metrics-server in kube-system
+        api_stdout, api_rc = run_kubectl_command(
+            "get", "apiservice", "v1beta1.metrics.k8s.io",
+            "-o", "json", timeout=10
         )
-
-        if rc != 0:
-            subscores["deployment_resources_valid"] = 0.0
-            print("✗ Cannot read bleater-api-gateway deployment")
+        apiservice_ok = False
+        if api_rc == 0:
+            apiservice = json.loads(api_stdout)
+            svc_ref = apiservice.get("spec", {}).get("service", {})
+            svc_name = svc_ref.get("name", "")
+            svc_ns = svc_ref.get("namespace", "")
+            apiservice_ok = (svc_name == "metrics-server" and svc_ns == "kube-system")
+        pipeline_checks.append(apiservice_ok)
+        if apiservice_ok:
+            print(f"  ✓ 2b: APIService points to {svc_ns}/{svc_name}")
         else:
-            deploy = json.loads(stdout)
-            containers = deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
-            gw_container = None
-            for c in containers:
-                if c.get("name") == "api-gateway":
-                    gw_container = c
-                    break
+            print(f"  ✗ 2b: APIService misconfigured (should be kube-system/metrics-server)")
 
-            if not gw_container:
-                gw_container = containers[0] if containers else {}
-
-            resources = gw_container.get("resources", {})
-            requests = resources.get("requests", {})
-            limits = resources.get("limits", {})
-
-            cpu_request_str = requests.get("cpu", "0m")
-            cpu_limit_str = limits.get("cpu", "0m")
-
-            def parse_cpu(val):
-                if isinstance(val, (int, float)):
-                    return int(val * 1000)
-                val = str(val)
-                if val.endswith("m"):
-                    return int(val[:-1])
-                return int(float(val) * 1000)
-
-            cpu_request = parse_cpu(cpu_request_str)
-            cpu_limit = parse_cpu(cpu_limit_str)
-
-            request_ok = cpu_request >= 50
-            limit_ok = cpu_limit >= 200
-
-            if request_ok and limit_ok:
-                subscores["deployment_resources_valid"] = 1.0
-                print(f"✓ Deployment resources: request={cpu_request}m, limit={cpu_limit}m")
-            else:
-                subscores["deployment_resources_valid"] = 0.0
-                if not request_ok:
-                    print(f"✗ CPU request too low: {cpu_request}m (need >= 50m)")
-                if not limit_ok:
-                    print(f"✗ CPU limit too low or missing: {cpu_limit}m (need >= 200m)")
-    except Exception as e:
-        print(f"Error checking deployment resources: {e}")
-        subscores["deployment_resources_valid"] = 0.0
-
-    weights["deployment_resources_valid"] = 1/13
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 8: hpa_replica_range_sane (1/13)
-    # minReplicas 2-5, maxReplicas 8-15
-    # No duplicate HPAs targeting bleater-api-gateway
-    # Must pass on BOTH reads
-    # ═════════════════════════════════════════════════════════════════════════
-    try:
-        min1 = spec1.get("minReplicas", 0)
-        max1 = spec1.get("maxReplicas", 0)
-        min2 = spec2.get("minReplicas", 0)
-        max2 = spec2.get("maxReplicas", 0)
-
-        range_ok1 = (2 <= min1 <= 5) and (8 <= max1 <= 15)
-        range_ok2 = (2 <= min2 <= 5) and (8 <= max2 <= 15)
-
-        # Check for duplicate HPAs targeting bleater-api-gateway
-        stdout, rc = run_kubectl_command(
-            "get", "hpa", "-o", "json", namespace=namespace, timeout=10
-        )
-        hpa_list = json.loads(stdout) if rc == 0 else {"items": []}
-        # Only count HPAs that target bleater-api-gateway deployment
-        gateway_hpas = [
-            h for h in hpa_list.get("items", [])
-            if h.get("spec", {}).get("scaleTargetRef", {}).get("name", "") == "bleater-api-gateway"
-        ]
-        hpa_count = len(gateway_hpas)
-        no_duplicates = hpa_count == 1
-
-        if range_ok1 and range_ok2 and no_duplicates:
-            subscores["hpa_replica_range_sane"] = 1.0
-            print(f"✓ Replica range: min={min1}/{min2}, max={max1}/{max2}, HPAs={hpa_count}")
-        else:
-            subscores["hpa_replica_range_sane"] = 0.0
-            if not range_ok1 or not range_ok2:
-                print(f"✗ Replica range: min={min1}/{min2} (need 2-5), max={max1}/{max2} (need 8-15)")
-            if not no_duplicates:
-                print(f"✗ Found {hpa_count} HPAs targeting bleater-api-gateway (need exactly 1)")
-    except Exception as e:
-        print(f"Error checking replica range: {e}")
-        subscores["hpa_replica_range_sane"] = 0.0
-
-    weights["hpa_replica_range_sane"] = 1/13
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 9: hpa_currently_computing (1/13)
-    # HPA ScalingActive condition is True
-    # currentMetrics shows actual CPU utilization (not <unknown>)
-    # Retry up to 3 times — HPA controller may need a few cycles after cleanup
-    # ═════════════════════════════════════════════════════════════════════════
-    try:
+        # 2c: HPA actively computing CPU metrics
         scaling_active = False
         has_cpu_metric = False
-
         for attempt in range(3):
             if attempt > 0:
-                print(f"  Retrying HPA computation check ({attempt + 1}/3)...")
+                print(f"    Retrying HPA computation check ({attempt + 1}/3)...")
                 time.sleep(30)
                 hpa_retry, _ = get_hpa_config(hpa_name, namespace)
                 if hpa_retry is None:
@@ -580,113 +402,227 @@ def grade(transcript: str) -> GradingResult:
             if scaling_active and has_cpu_metric:
                 break
 
-        if scaling_active and has_cpu_metric:
-            subscores["hpa_currently_computing"] = 1.0
-            print("✓ HPA actively computing CPU metrics — ScalingActive=True")
+        hpa_computing = scaling_active and has_cpu_metric
+        pipeline_checks.append(hpa_computing)
+        if hpa_computing:
+            print(f"  ✓ 2c: HPA actively computing CPU metrics (ScalingActive=True)")
         else:
-            subscores["hpa_currently_computing"] = 0.0
             if not scaling_active:
-                print("✗ HPA ScalingActive is not True")
+                print(f"  ✗ 2c: HPA ScalingActive is not True")
             if not has_cpu_metric:
-                print("✗ HPA currentMetrics does not show CPU utilization")
-    except Exception as e:
-        print(f"Error checking HPA computation status: {e}")
-        subscores["hpa_currently_computing"] = 0.0
+                print(f"  ✗ 2c: HPA currentMetrics does not show CPU utilization")
 
-    weights["hpa_currently_computing"] = 1/13
+        passed = sum(1 for c in pipeline_checks if c)
+        subscores["metrics_pipeline_healthy"] = passed / len(pipeline_checks)
+        print(f"  => metrics_pipeline_healthy: {passed}/{len(pipeline_checks)} = {subscores['metrics_pipeline_healthy']:.3f}")
+
+    except Exception as e:
+        print(f"Error checking metrics pipeline: {e}")
+        subscores["metrics_pipeline_healthy"] = 0.0
+
+    weights["metrics_pipeline_healthy"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 10: limitrange_not_blocking (1/13)
-    # The LimitRange 'bleater-resource-governance' in bleater namespace
-    # has max.cpu=20m which blocks setting proper deployment resources.
-    # It must be deleted or modified to allow cpu >= 50m.
+    # SUBSCORE 3: workload_config_valid (0.20)
+    # 5 sub-checks averaged (checked on BOTH reads where applicable):
+    #   3a. CPU target 40-80%, no memory metric
+    #   3b. CPU request >= 50m
+    #   3c. CPU limit >= 200m
+    #   3d. No LimitRange blocking (max cpu allows >= 50m)
+    #   3e. Replica range sane (min 2-5, max 8-15) + no duplicate HPAs
     # ═════════════════════════════════════════════════════════════════════════
     try:
-        stdout, rc = run_kubectl_command(
+        workload_checks = []
+
+        # 3a: CPU target 40-80%, no memory metric
+        def check_cpu_target(spec):
+            metrics = spec.get("metrics", [])
+            cpu_targets = []
+            has_memory = False
+            for m in metrics:
+                if m.get("type") != "Resource":
+                    continue
+                res = m.get("resource", {})
+                name = res.get("name", "")
+                target = res.get("target", {})
+                if name == "cpu":
+                    cpu_targets.append(target.get("averageUtilization", 0))
+                if name == "memory":
+                    has_memory = True
+            if not cpu_targets:
+                return False
+            if has_memory:
+                return False
+            return 40 <= cpu_targets[0] <= 80
+
+        cpu_ok = check_cpu_target(spec1) and check_cpu_target(spec2)
+        workload_checks.append(cpu_ok)
+        cpu_val1 = "?"
+        for m in spec1.get("metrics", []):
+            if m.get("type") == "Resource" and m.get("resource", {}).get("name") == "cpu":
+                cpu_val1 = m.get("resource", {}).get("target", {}).get("averageUtilization", "?")
+        if cpu_ok:
+            print(f"  ✓ 3a: CPU target {cpu_val1}% (40-80%), no memory metric")
+        else:
+            print(f"  ✗ 3a: CPU target {cpu_val1}% — need 40-80% with no memory metric")
+
+        # 3b & 3c: Deployment CPU request >= 50m, limit >= 200m
+        deploy_stdout, deploy_rc = run_kubectl_command(
+            "get", "deployment", "bleater-api-gateway",
+            "-o", "json", namespace=namespace, timeout=10
+        )
+        cpu_request = 0
+        cpu_limit = 0
+        if deploy_rc == 0:
+            deploy = json.loads(deploy_stdout)
+            containers = deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+            gw_container = None
+            for c in containers:
+                if c.get("name") == "api-gateway":
+                    gw_container = c
+                    break
+            if not gw_container:
+                gw_container = containers[0] if containers else {}
+
+            resources = gw_container.get("resources", {})
+            cpu_request = parse_cpu(resources.get("requests", {}).get("cpu", "0m"))
+            cpu_limit = parse_cpu(resources.get("limits", {}).get("cpu", "0m"))
+
+        req_ok = cpu_request >= 50
+        workload_checks.append(req_ok)
+        if req_ok:
+            print(f"  ✓ 3b: CPU request {cpu_request}m (>= 50m)")
+        else:
+            print(f"  ✗ 3b: CPU request {cpu_request}m (need >= 50m)")
+
+        lim_ok = cpu_limit >= 200
+        workload_checks.append(lim_ok)
+        if lim_ok:
+            print(f"  ✓ 3c: CPU limit {cpu_limit}m (>= 200m)")
+        else:
+            print(f"  ✗ 3c: CPU limit {cpu_limit}m (need >= 200m)")
+
+        # 3d: No LimitRange blocking
+        lr_stdout, lr_rc = run_kubectl_command(
             "get", "limitrange", "-o", "json",
             namespace=namespace, timeout=10
         )
-
-        if rc != 0:
-            # Can't read — assume it might still be there
-            subscores["limitrange_not_blocking"] = 0.0
-            print("✗ Cannot read LimitRange resources in bleater namespace")
-        else:
-            lr_list = json.loads(stdout)
-            items = lr_list.get("items", [])
-            blocking = False
-
-            for lr in items:
-                lr_name = lr.get("metadata", {}).get("name", "")
-                limits = lr.get("spec", {}).get("limits", [])
-                for limit in limits:
+        lr_blocking = False
+        if lr_rc == 0:
+            lr_list = json.loads(lr_stdout)
+            for lr in lr_list.get("items", []):
+                for limit in lr.get("spec", {}).get("limits", []):
                     if limit.get("type") == "Container":
                         max_cpu = limit.get("max", {}).get("cpu", "")
                         if max_cpu:
-                            # Parse the max CPU value
-                            if max_cpu.endswith("m"):
-                                max_val = int(max_cpu[:-1])
-                            else:
-                                max_val = int(float(max_cpu) * 1000)
+                            max_val = parse_cpu(max_cpu)
                             if max_val < 50:
-                                blocking = True
-                                print(f"✗ LimitRange '{lr_name}' has max.cpu={max_cpu} — blocks setting cpu >= 50m")
-
-            if not blocking:
-                subscores["limitrange_not_blocking"] = 1.0
-                print("✓ No LimitRange blocking deployment resource fixes")
-            else:
-                subscores["limitrange_not_blocking"] = 0.0
-    except Exception as e:
-        print(f"Error checking LimitRange: {e}")
-        subscores["limitrange_not_blocking"] = 0.0
-
-    weights["limitrange_not_blocking"] = 1/13
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 11: apiservice_correctly_configured (1/13)
-    # The APIService v1beta1.metrics.k8s.io must point to the correct
-    # service (metrics-server) in kube-system. If it points to a wrong
-    # service name, the API server can't proxy metrics requests.
-    # ═════════════════════════════════════════════════════════════════════════
-    try:
-        stdout, rc = run_kubectl_command(
-            "get", "apiservice", "v1beta1.metrics.k8s.io",
-            "-o", "json", timeout=10
-        )
-
-        if rc != 0:
-            subscores["apiservice_correctly_configured"] = 0.0
-            print("✗ Cannot read APIService v1beta1.metrics.k8s.io")
+                                lr_blocking = True
+        lr_ok = not lr_blocking
+        workload_checks.append(lr_ok)
+        if lr_ok:
+            print(f"  ✓ 3d: No LimitRange blocking resource fixes")
         else:
-            apiservice = json.loads(stdout)
-            service_ref = apiservice.get("spec", {}).get("service", {})
-            service_name = service_ref.get("name", "")
-            service_ns = service_ref.get("namespace", "")
+            print(f"  ✗ 3d: LimitRange blocks CPU >= 50m")
 
-            if service_name == "metrics-server" and service_ns == "kube-system":
-                subscores["apiservice_correctly_configured"] = 1.0
-                print(f"✓ APIService points to {service_ns}/{service_name}")
-            else:
-                subscores["apiservice_correctly_configured"] = 0.0
-                print(f"✗ APIService points to {service_ns}/{service_name} — should be kube-system/metrics-server")
+        # 3e: Replica range sane + no duplicate HPAs
+        min1 = spec1.get("minReplicas", 0)
+        max1 = spec1.get("maxReplicas", 0)
+        min2 = spec2.get("minReplicas", 0)
+        max2 = spec2.get("maxReplicas", 0)
+        range_ok = (2 <= min1 <= 5) and (8 <= max1 <= 15) and (2 <= min2 <= 5) and (8 <= max2 <= 15)
+
+        hpa_stdout, hpa_rc = run_kubectl_command(
+            "get", "hpa", "-o", "json", namespace=namespace, timeout=10
+        )
+        hpa_list = json.loads(hpa_stdout) if hpa_rc == 0 else {"items": []}
+        gateway_hpas = [
+            h for h in hpa_list.get("items", [])
+            if h.get("spec", {}).get("scaleTargetRef", {}).get("name", "") == "bleater-api-gateway"
+        ]
+        no_dups = len(gateway_hpas) == 1
+        replicas_ok = range_ok and no_dups
+        workload_checks.append(replicas_ok)
+        if replicas_ok:
+            print(f"  ✓ 3e: Replicas min={min1}, max={max1}, HPAs={len(gateway_hpas)}")
+        else:
+            if not range_ok:
+                print(f"  ✗ 3e: Replicas min={min1}/{min2} (need 2-5), max={max1}/{max2} (need 8-15)")
+            if not no_dups:
+                print(f"  ✗ 3e: {len(gateway_hpas)} HPAs target bleater-api-gateway (need exactly 1)")
+
+        passed = sum(1 for c in workload_checks if c)
+        subscores["workload_config_valid"] = passed / len(workload_checks)
+        print(f"  => workload_config_valid: {passed}/{len(workload_checks)} = {subscores['workload_config_valid']:.3f}")
+
     except Exception as e:
-        print(f"Error checking APIService: {e}")
-        subscores["apiservice_correctly_configured"] = 0.0
+        print(f"Error checking workload config: {e}")
+        subscores["workload_config_valid"] = 0.0
 
-    weights["apiservice_correctly_configured"] = 1/13
+    weights["workload_config_valid"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 12: static_pod_enforcer_removed (1/13)
-    # A static pod manifest at /var/lib/rancher/k3s/agent/pod-manifests/
-    # continuously reverts HPA config and recreates deleted CronJobs.
-    # Static pods can't be deleted via kubectl — the manifest file must
-    # be removed from disk to stop the pod.
+    # SUBSCORE 4: enforcement_removed (0.20)
+    # 3 sub-checks averaged:
+    #   4a. ALL enforcer CronJobs deleted (not just suspended) across all namespaces
+    #   4b. Static pod enforcer manifest removed from disk
+    #   4c. K3s auto-deploy enforcer manifest removed from disk
     # ═════════════════════════════════════════════════════════════════════════
     try:
-        manifest_dir = "/var/lib/rancher/k3s/agent/pod-manifests"
-        enforcer_found = False
+        enforcement_checks = []
 
+        # 4a: All enforcer CronJobs deleted (not suspended)
+        # Check across kube-ops, bleater-env, default namespaces for enforcers
+        # These CronJobs read encoded policies from ConfigMaps and patch the HPA
+        enforcer_cronjobs_found = []
+
+        # Check kube-ops enforcers (containerd-log-rotate, cni-bridge-monitor,
+        # oom-score-adjuster, node-pressure-monitor are the ones that patch HPA)
+        for ns in ["kube-ops", "bleater-env", "default"]:
+            cj_stdout, cj_rc = run_kubectl_command(
+                "get", "cronjobs", "-o", "jsonpath={.items[*].metadata.name}",
+                namespace=ns, timeout=10
+            )
+            if cj_rc == 0 and cj_stdout.strip():
+                for cj_name in cj_stdout.strip().split():
+                    # Read the CronJob's script ConfigMap to check if it patches HPA
+                    cm_name = cj_name + "-script"
+                    cm_stdout, cm_rc = run_kubectl_command(
+                        "get", "configmap", cm_name,
+                        "-o", "jsonpath={.data.script\\.sh}",
+                        namespace=ns, timeout=10
+                    )
+                    if cm_rc == 0 and cm_stdout:
+                        # If the script patches HPA or reads drift policy CMs, it's an enforcer
+                        if "kubectl patch hpa" in cm_stdout or "drift" in cm_stdout.lower() or "policy" in cm_stdout.lower():
+                            enforcer_cronjobs_found.append(f"{ns}/{cj_name}")
+
+        # Also check kube-system for platform-compliance-audit
+        cj_stdout, cj_rc = run_kubectl_command(
+            "get", "cronjob", "platform-compliance-audit",
+            namespace="kube-system", timeout=10
+        )
+        if cj_rc == 0 and cj_stdout:
+            enforcer_cronjobs_found.append("kube-system/platform-compliance-audit")
+
+        # Check for k3s-resource-reconciler DaemonSet
+        ds_stdout, ds_rc = run_kubectl_command(
+            "get", "daemonset", "k3s-resource-reconciler",
+            namespace="kube-system", timeout=10
+        )
+        if ds_rc == 0 and ds_stdout:
+            enforcer_cronjobs_found.append("kube-system/k3s-resource-reconciler (DaemonSet)")
+
+        cj_ok = len(enforcer_cronjobs_found) == 0
+        enforcement_checks.append(cj_ok)
+        if cj_ok:
+            print(f"  ✓ 4a: All enforcer CronJobs/DaemonSets deleted")
+        else:
+            print(f"  ✗ 4a: Enforcer resources still exist: {', '.join(enforcer_cronjobs_found)}")
+
+        # 4b: Static pod enforcer manifest removed from disk
+        manifest_dir = "/var/lib/rancher/k3s/agent/pod-manifests"
+        static_pod_found = False
         if os.path.isdir(manifest_dir):
             for f in os.listdir(manifest_dir):
                 fpath = os.path.join(manifest_dir, f)
@@ -694,68 +630,118 @@ def grade(transcript: str) -> GradingResult:
                     try:
                         with open(fpath, "r") as fh:
                             content = fh.read()
-                        # Check if this manifest patches HPA or recreates CronJobs
                         if "bleater-api-gateway-hpa" in content or "platform-controller-manifests" in content:
-                            enforcer_found = True
-                            print(f"✗ Static pod enforcer manifest found: {fpath}")
+                            static_pod_found = True
+                            print(f"    Found: {fpath}")
                             break
                     except Exception:
                         pass
 
-        if not enforcer_found:
-            subscores["static_pod_enforcer_removed"] = 1.0
-            print("✓ No static pod enforcer manifests found — enforcement stopped")
+        static_ok = not static_pod_found
+        enforcement_checks.append(static_ok)
+        if static_ok:
+            print(f"  ✓ 4b: Static pod enforcer manifest removed")
         else:
-            subscores["static_pod_enforcer_removed"] = 0.0
-    except Exception as e:
-        print(f"Error checking static pod manifests: {e}")
-        subscores["static_pod_enforcer_removed"] = 0.0
+            print(f"  ✗ 4b: Static pod enforcer manifest still on disk")
 
-    weights["static_pod_enforcer_removed"] = 1/13
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 13: k3s_autodeploy_enforcer_removed (1/13)
-    # K3s auto-deploy manifests in /var/lib/rancher/k3s/server/manifests/
-    # are automatically reconciled by k3s. Any manifest there that patches
-    # the HPA must be removed from disk AND the created CronJob must be gone.
-    # ═════════════════════════════════════════════════════════════════════════
-    try:
-        server_manifest_dir = "/var/lib/rancher/k3s/server/manifests"
-        enforcer_found = False
-
-        if os.path.isdir(server_manifest_dir):
-            for f in os.listdir(server_manifest_dir):
-                fpath = os.path.join(server_manifest_dir, f)
+        # 4c: K3s auto-deploy enforcer manifest removed from disk
+        server_dir = "/var/lib/rancher/k3s/server/manifests"
+        server_manifest_found = False
+        if os.path.isdir(server_dir):
+            for f in os.listdir(server_dir):
+                fpath = os.path.join(server_dir, f)
                 if os.path.isfile(fpath) and f.endswith((".yaml", ".yml")):
                     try:
                         with open(fpath, "r") as fh:
                             content = fh.read()
                         if "bleater-api-gateway-hpa" in content or "platform-compliance" in content:
-                            enforcer_found = True
-                            print(f"✗ K3s auto-deploy enforcer manifest found: {fpath}")
+                            server_manifest_found = True
+                            print(f"    Found: {fpath}")
                             break
                     except Exception:
                         pass
 
-        # Also check if the CronJob still exists in kube-system
-        stdout, rc = run_kubectl_command(
-            "get", "cronjob", "platform-compliance-audit",
-            namespace="kube-system", timeout=10
-        )
-        if rc == 0 and stdout:
-            enforcer_found = True
-            print("✗ platform-compliance-audit CronJob still exists in kube-system")
-
-        if not enforcer_found:
-            subscores["k3s_autodeploy_enforcer_removed"] = 1.0
-            print("✓ No k3s auto-deploy enforcer manifests found")
+        server_ok = not server_manifest_found
+        enforcement_checks.append(server_ok)
+        if server_ok:
+            print(f"  ✓ 4c: K3s auto-deploy enforcer manifest removed")
         else:
-            subscores["k3s_autodeploy_enforcer_removed"] = 0.0
-    except Exception as e:
-        print(f"Error checking k3s auto-deploy manifests: {e}")
-        subscores["k3s_autodeploy_enforcer_removed"] = 0.0
+            print(f"  ✗ 4c: K3s auto-deploy enforcer manifest still on disk")
 
-    weights["k3s_autodeploy_enforcer_removed"] = 1/13
+        passed = sum(1 for c in enforcement_checks if c)
+        subscores["enforcement_removed"] = passed / len(enforcement_checks)
+        print(f"  => enforcement_removed: {passed}/{len(enforcement_checks)} = {subscores['enforcement_removed']:.3f}")
+
+    except Exception as e:
+        print(f"Error checking enforcement removal: {e}")
+        subscores["enforcement_removed"] = 0.0
+
+    weights["enforcement_removed"] = W
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SUBSCORE 5: fix_durable (0.20)
+    # ALL-OR-NOTHING: Every HPA param must be correct on BOTH reads.
+    # This tests that enforcement is truly neutralized — if any CronJob,
+    # static pod, or k3s manifest survived, the HPA will be reverted
+    # between read1 and read2.
+    # Checks: windows, selectPolicy, policies, CPU target, replicas all
+    # must match SRE standards on BOTH reads.
+    # ═════════════════════════════════════════════════════════════════════════
+    try:
+        durable = True
+
+        # Check scaleDown window on both reads
+        if sd_w1 < 180 or sd_w2 < 180:
+            durable = False
+            print(f"  ✗ 5: ScaleDown window drifted: {sd_w1}s → {sd_w2}s")
+
+        # Check scaleUp window on both reads
+        if su_w1 < 45 or su_w2 < 45:
+            durable = False
+            print(f"  ✗ 5: ScaleUp window drifted: {su_w1}s → {su_w2}s")
+
+        # Check selectPolicy on both reads
+        if sd_sel1 == "Max" or sd_sel2 == "Max":
+            durable = False
+            print(f"  ✗ 5: ScaleDown selectPolicy drifted: {sd_sel1} → {sd_sel2}")
+        if su_sel1 == "Max" or su_sel2 == "Max":
+            durable = False
+            print(f"  ✗ 5: ScaleUp selectPolicy drifted: {su_sel1} → {su_sel2}")
+
+        # Check CPU target on both reads
+        if not (check_cpu_target(spec1) and check_cpu_target(spec2)):
+            durable = False
+            print(f"  ✗ 5: CPU target drifted between reads")
+
+        # Check replica range on both reads
+        if not ((2 <= spec1.get("minReplicas", 0) <= 5) and
+                (8 <= spec1.get("maxReplicas", 0) <= 15) and
+                (2 <= spec2.get("minReplicas", 0) <= 5) and
+                (8 <= spec2.get("maxReplicas", 0) <= 15)):
+            durable = False
+            print(f"  ✗ 5: Replica range drifted between reads")
+
+        # Check policies on both reads
+        if not (check_sd_policies(sd1) and check_sd_policies(sd2)):
+            durable = False
+            print(f"  ✗ 5: ScaleDown policies drifted between reads")
+        if not (check_su_policies(su1) and check_su_policies(su2)):
+            durable = False
+            print(f"  ✗ 5: ScaleUp policies drifted between reads")
+
+        if durable:
+            subscores["fix_durable"] = 1.0
+            print(f"  ✓ 5: All HPA parameters stable across both reads")
+        else:
+            subscores["fix_durable"] = 0.0
+
+        print(f"  => fix_durable: {subscores['fix_durable']:.3f}")
+
+    except Exception as e:
+        print(f"Error checking durability: {e}")
+        subscores["fix_durable"] = 0.0
+
+    weights["fix_durable"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
     # Final score calculation
@@ -769,50 +755,29 @@ def grade(transcript: str) -> GradingResult:
     feedback_lines = []
 
     checks = [
-        ("scaledown_window_durable",
-         "ScaleDown cooldown window >= 180s and selectPolicy != Max (durable)",
-         "ScaleDown cooldown too short or selectPolicy=Max — pods removed too aggressively"),
-        ("scaleup_window_durable",
-         "ScaleUp dampening window >= 45s and selectPolicy != Max (durable)",
-         "ScaleUp reacts too fast or selectPolicy=Max — no dampening for transient spikes"),
-        ("scaledown_policy_conservative",
-         "ScaleDown policies conservative — won't remove >30% pods in <60s",
-         "ScaleDown policies too aggressive — can remove too many pods too fast"),
-        ("scaleup_policy_conservative",
-         "ScaleUp policies controlled — won't add >100% pods in <30s",
-         "ScaleUp policies too aggressive — can spike capacity too fast"),
-        ("metrics_pipeline_functional",
-         "Metrics pipeline healthy — HPA can compute pod CPU utilization",
-         "Metrics pipeline broken — HPA cannot get pod metrics, will stall or thrash"),
-        ("cpu_target_appropriate",
-         "CPU target utilization is appropriate (40-80%) with no conflicting metrics",
-         "CPU target too low or extra memory metric causing unnecessary scaling"),
-        ("deployment_resources_valid",
-         "Deployment has proper CPU requests (>= 50m) and limits (>= 200m)",
-         "Deployment CPU resources misconfigured — HPA calculates wildly inflated utilization"),
-        ("hpa_replica_range_sane",
-         "Replica range is reasonable (min 2-5, max 8-15) with no duplicate HPAs",
-         "Replica range too wide or duplicate HPAs causing scaling conflicts"),
-        ("hpa_currently_computing",
-         "HPA is actively computing metrics — ScalingActive=True",
-         "HPA cannot compute metrics — compound failure from broken pipeline, resources, or conflicts"),
-        ("limitrange_not_blocking",
-         "LimitRange not blocking deployment resource fixes (max cpu allows >= 50m)",
-         "LimitRange max.cpu too low — prevents setting proper deployment CPU requests/limits"),
-        ("apiservice_correctly_configured",
-         "APIService v1beta1.metrics.k8s.io points to correct metrics-server service",
-         "APIService misconfigured — API server proxying metrics to wrong service"),
-        ("static_pod_enforcer_removed",
-         "Static pod enforcer manifest removed from disk — enforcement stopped",
-         "Static pod enforcer still active — continuously reverting HPA config and recreating CronJobs"),
-        ("k3s_autodeploy_enforcer_removed",
-         "K3s auto-deploy enforcer manifest removed from /var/lib/rancher/k3s/server/manifests/",
-         "K3s auto-deploy enforcer still active — k3s recreates compliance CronJob from server manifest"),
+        ("hpa_behavior_compliant",
+         f"HPA behavior config meets SRE standards ({subscores.get('hpa_behavior_compliant', 0):.0%} of checks passed)",
+         f"HPA behavior config non-compliant ({subscores.get('hpa_behavior_compliant', 0):.0%} of checks passed) — windows, selectPolicy, or policies incorrect"),
+        ("metrics_pipeline_healthy",
+         f"Metrics pipeline healthy ({subscores.get('metrics_pipeline_healthy', 0):.0%} of checks passed)",
+         f"Metrics pipeline issues ({subscores.get('metrics_pipeline_healthy', 0):.0%} of checks passed) — metrics-server, APIService, or HPA computation broken"),
+        ("workload_config_valid",
+         f"Workload config valid ({subscores.get('workload_config_valid', 0):.0%} of checks passed)",
+         f"Workload config issues ({subscores.get('workload_config_valid', 0):.0%} of checks passed) — CPU target/resources, LimitRange, or replica range incorrect"),
+        ("enforcement_removed",
+         f"Enforcement mechanisms removed ({subscores.get('enforcement_removed', 0):.0%} of checks passed)",
+         f"Enforcement still active ({subscores.get('enforcement_removed', 0):.0%} of checks passed) — CronJobs, static pod, or k3s manifest still present"),
+        ("fix_durable",
+         "Fix is durable — all HPA params stable across dual-read verification window",
+         "Fix is NOT durable — HPA config drifted between reads (enforcement still active)"),
     ]
 
     for key, pass_msg, fail_msg in checks:
-        if subscores.get(key, 0) >= 1.0:
+        score = subscores.get(key, 0)
+        if score >= 1.0:
             feedback_lines.append(f"✅ {pass_msg}")
+        elif score > 0:
+            feedback_lines.append(f"⚠️ {fail_msg}")
         else:
             feedback_lines.append(f"❌ {fail_msg}")
 

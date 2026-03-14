@@ -20,25 +20,18 @@ prompt: |
   - Alert fatigue from scaling notifications
 
   Your task is to investigate and fix ALL the issues contributing to the HPA instability.
-  The problems span multiple areas — the HPA configuration itself (stabilization windows,
-  scaling policies, select policy, CPU target, replica bounds), the metrics pipeline
-  (metrics-server deployment, service selector, APIService configuration), workload resource
-  definitions (CPU requests/limits, LimitRange constraints), and potentially conflicting
-  resources (duplicate HPAs, enforcement CronJobs, static pod enforcers, k3s auto-deploy manifests).
+  The root causes span multiple areas and may involve the HPA configuration, the metrics pipeline,
+  workload resource definitions, and possibly other mechanisms that enforce or revert configuration changes.
 
-  An HPA has been configured for the api-gateway but is causing instability.
-
-  The team's SRE scaling standards are documented in the Gitea wiki (SRE-Scaling-Standards page)
-  and define the required production thresholds for stabilization windows, CPU targets,
-  replica ranges, and scaling policies. Check the wiki, Mattermost #platform-ops channel,
-  and Gitea issues for context on what happened and what the correct values should be.
+  The team has documented scaling standards somewhere in the platform documentation. Check the Gitea wiki,
+  Mattermost channels, and Gitea issues for context on what happened and what the correct values should be.
+  Be careful — not all documentation sources may be up to date or consistent with each other.
 
   Verify the fix by ensuring:
-  - The HPA is no longer thrashing — stabilization windows, scaling policies, and select policy meet SRE standards
-  - Scaling behavior is stable and appropriate for production workloads — CPU target and replica range are within approved bounds
-  - All corrections persist over time (are not reverted by enforcement CronJobs, static pods, or auto-deploy manifests)
-  - The metrics pipeline is healthy — APIService, metrics-server service/deployment, and deployment CPU requests are all correctly configured
-  - No LimitRange or other resource constraints block the required deployment resource settings
+  - The HPA is no longer thrashing and meets the team's production scaling standards
+  - The metrics pipeline is healthy and the HPA can compute actual CPU metrics
+  - All corrections persist over time and are not reverted by any mechanism
+  - No resource constraints block the required configuration changes
 
   IMPORTANT: Do NOT use any interactive commands, for example `-i` or `-it`, in `docker exec`,
   or any other TTY commands.
