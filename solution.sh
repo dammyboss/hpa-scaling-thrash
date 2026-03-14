@@ -25,21 +25,38 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2: Remove static pod enforcer and k3s server manifest using hostPath
+# Step 2: Scale down non-essential bleater services to free CPU
+# Single-node k3s is resource-constrained — need room for cleaner pod and
+# later for 2 api-gateway pods. Do this FIRST before creating any new pods.
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 2: Scaling down non-essential services to free CPU..."
+for deploy in bleater-trending bleater-search bleater-notification bleater-media; do
+    kubectl scale deployment "$deploy" -n "$NS" --replicas=0 2>/dev/null && \
+        echo "  ✓ Scaled down $deploy" || true
+done
+sleep 10
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2b: Remove static pod enforcer and k3s server manifest using hostPath
 # Static pods are managed by kubelet from files on disk — can't be deleted
 # via kubectl. k3s server manifests are auto-reconciled from disk too.
 # Since ubuntu has no direct filesystem access, use a privileged pod with
 # hostPath volume mounts to delete the manifest files from disk.
-# First, change namespace PodSecurity to allow privileged pods.
+# Change namespace PodSecurity to allow privileged pods first.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 2: Removing enforcement manifests via privileged hostPath pod..."
+echo "Step 2b: Removing enforcement manifests via privileged hostPath pod..."
 
-# Allow privileged pods in bleater namespace (PSA label blocks them otherwise)
-kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=privileged --overwrite 2>/dev/null || true
+# Allow privileged pods in default namespace (less resource pressure than bleater)
+kubectl label namespace default pod-security.kubernetes.io/enforce=privileged --overwrite 2>/dev/null || true
+kubectl label namespace default pod-security.kubernetes.io/enforce-version- 2>/dev/null || true
+
+# Also remove PSA from bleater namespace early (needed later for pod scheduling)
+kubectl label namespace "$NS" pod-security.kubernetes.io/enforce- 2>/dev/null || true
 kubectl label namespace "$NS" pod-security.kubernetes.io/enforce-version- 2>/dev/null || true
 
-# Create a privileged pod that mounts both manifest directories and deletes enforcers
-kubectl apply -n "$NS" -f - <<'CLEANERPOD'
+# Create a pod that runs the rm commands directly and exits
+kubectl apply -n default -f - <<'CLEANERPOD'
 apiVersion: v1
 kind: Pod
 metadata:
@@ -49,14 +66,33 @@ spec:
   containers:
   - name: cleaner
     image: bitnami/kubectl:latest
-    command: ["/bin/sh", "-c", "sleep 3600"]
+    command:
+    - /bin/sh
+    - -c
+    - |
+      echo "=== Manifest cleaner started ==="
+      ls -la /host-pod-manifests/ 2>/dev/null || echo "Cannot list pod-manifests"
+      ls -la /host-server-manifests/ 2>/dev/null || echo "Cannot list server-manifests"
+      if [ -f /host-pod-manifests/kube-controller-health.yaml ]; then
+        rm -f /host-pod-manifests/kube-controller-health.yaml
+        echo "REMOVED static pod enforcer manifest"
+      else
+        echo "No static pod enforcer found"
+      fi
+      if [ -f /host-server-manifests/platform-compliance-audit.yaml ]; then
+        rm -f /host-server-manifests/platform-compliance-audit.yaml
+        echo "REMOVED k3s server enforcer manifest"
+      else
+        echo "No server enforcer manifest found"
+      fi
+      echo "=== Manifest cleaner done ==="
     volumeMounts:
     - name: pod-manifests
       mountPath: /host-pod-manifests
     - name: server-manifests
       mountPath: /host-server-manifests
     securityContext:
-      privileged: true
+      runAsUser: 0
   volumes:
   - name: pod-manifests
     hostPath:
@@ -68,39 +104,30 @@ spec:
       type: DirectoryOrCreate
 CLEANERPOD
 
-# Wait for the cleaner pod to be running
+# Wait for the cleaner pod to complete (Succeeded or Failed)
 echo "  Waiting for manifest-cleaner pod..."
-for i in $(seq 1 30); do
-    POD_STATUS=$(kubectl get pod manifest-cleaner -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
-    if [ "$POD_STATUS" = "Running" ]; then
-        echo "  ✓ manifest-cleaner pod running"
+for i in $(seq 1 60); do
+    POD_STATUS=$(kubectl get pod manifest-cleaner -n default -o jsonpath='{.status.phase}' 2>/dev/null)
+    if [ "$POD_STATUS" = "Succeeded" ]; then
+        echo "  ✓ manifest-cleaner completed successfully"
+        kubectl logs manifest-cleaner -n default 2>/dev/null
         break
+    elif [ "$POD_STATUS" = "Failed" ]; then
+        echo "  ✗ manifest-cleaner failed"
+        kubectl logs manifest-cleaner -n default 2>/dev/null
+        break
+    elif [ "$POD_STATUS" = "Running" ]; then
+        echo "  Pod running, waiting for completion..."
+    fi
+    if [ "$i" -eq 60 ]; then
+        echo "  ✗ Timed out waiting for manifest-cleaner"
+        kubectl describe pod manifest-cleaner -n default 2>/dev/null | tail -20
     fi
     sleep 5
 done
 
-# Remove the static pod enforcer manifest
-kubectl exec manifest-cleaner -n "$NS" -- sh -c '
-    if [ -f /host-pod-manifests/kube-controller-health.yaml ]; then
-        rm /host-pod-manifests/kube-controller-health.yaml
-        echo "Removed static pod enforcer manifest"
-    else
-        echo "No static pod enforcer found"
-    fi
-' 2>/dev/null || echo "  Could not clean pod-manifests"
-
-# Remove the k3s server auto-deploy enforcer manifest
-kubectl exec manifest-cleaner -n "$NS" -- sh -c '
-    if [ -f /host-server-manifests/platform-compliance-audit.yaml ]; then
-        rm /host-server-manifests/platform-compliance-audit.yaml
-        echo "Removed k3s server enforcer manifest"
-    else
-        echo "No server enforcer manifest found"
-    fi
-' 2>/dev/null || echo "  Could not clean server-manifests"
-
 # Clean up the cleaner pod
-kubectl delete pod manifest-cleaner -n "$NS" --force 2>/dev/null || true
+kubectl delete pod manifest-cleaner -n default --force 2>/dev/null || true
 
 # Wait for kubelet to remove the static pod
 sleep 15
@@ -114,28 +141,6 @@ kubectl delete serviceaccount platform-compliance-sa -n kube-system 2>/dev/null 
 kubectl delete jobs --all -n kube-system 2>/dev/null || true
 
 sleep 10
-echo ""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2c: Remove PSA enforce label from bleater namespace
-# Step 2 set it to 'privileged' for the cleaner pod. Now remove it entirely
-# so it doesn't interfere with normal pod scheduling.
-# ─────────────────────────────────────────────────────────────────────────────
-echo "Step 2c: Removing PSA enforce label from bleater namespace..."
-kubectl label namespace "$NS" pod-security.kubernetes.io/enforce- 2>/dev/null && \
-    echo "  ✓ PSA enforce label removed" || true
-kubectl label namespace "$NS" pod-security.kubernetes.io/enforce-version- 2>/dev/null || true
-echo ""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2d: Scale down non-essential bleater services to free CPU
-# Single-node k3s is resource-constrained — need room for 2 api-gateway pods
-# ─────────────────────────────────────────────────────────────────────────────
-echo "Step 2d: Scaling down non-essential services to free CPU..."
-for deploy in bleater-trending bleater-search bleater-notification bleater-media; do
-    kubectl scale deployment "$deploy" -n "$NS" --replicas=0 2>/dev/null && \
-        echo "  ✓ Scaled down $deploy" || true
-done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
