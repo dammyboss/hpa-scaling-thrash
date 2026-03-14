@@ -25,45 +25,87 @@ done
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2: Remove the static pod enforcer FIRST
-# The manifest is protected with chattr +i (immutable flag).
-# Must clear immutable flag before removing.
+# Step 2: Remove static pod enforcer and k3s server manifest using hostPath
+# Static pods are managed by kubelet from files on disk — can't be deleted
+# via kubectl. k3s server manifests are auto-reconciled from disk too.
+# Since ubuntu has no direct filesystem access, use a privileged pod with
+# hostPath volume mounts to delete the manifest files from disk.
+# First, change namespace PodSecurity to allow privileged pods.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 2: Checking for static pod enforcers..."
+echo "Step 2: Removing enforcement manifests via privileged hostPath pod..."
 
-# List static pod manifests
-ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || true
+# Allow privileged pods in bleater namespace (PSA label blocks them otherwise)
+kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=privileged --overwrite 2>/dev/null || true
+kubectl label namespace "$NS" pod-security.kubernetes.io/enforce-version- 2>/dev/null || true
 
-# Remove the manifest file (ubuntu has write access to this directory)
-if cat /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa"; then
-    rm /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml
-    echo "  ✓ Static pod enforcer manifest removed"
-else
-    echo "  No enforcer static pod found"
-fi
+# Create a privileged pod that mounts both manifest directories and deletes enforcers
+kubectl apply -n "$NS" -f - <<'CLEANERPOD'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: manifest-cleaner
+spec:
+  restartPolicy: Never
+  containers:
+  - name: cleaner
+    image: bitnami/kubectl:latest
+    command: ["/bin/sh", "-c", "sleep 3600"]
+    volumeMounts:
+    - name: pod-manifests
+      mountPath: /host-pod-manifests
+    - name: server-manifests
+      mountPath: /host-server-manifests
+    securityContext:
+      privileged: true
+  volumes:
+  - name: pod-manifests
+    hostPath:
+      path: /var/lib/rancher/k3s/agent/pod-manifests
+      type: DirectoryOrCreate
+  - name: server-manifests
+    hostPath:
+      path: /var/lib/rancher/k3s/server/manifests
+      type: DirectoryOrCreate
+CLEANERPOD
+
+# Wait for the cleaner pod to be running
+echo "  Waiting for manifest-cleaner pod..."
+for i in $(seq 1 30); do
+    POD_STATUS=$(kubectl get pod manifest-cleaner -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)
+    if [ "$POD_STATUS" = "Running" ]; then
+        echo "  ✓ manifest-cleaner pod running"
+        break
+    fi
+    sleep 5
+done
+
+# Remove the static pod enforcer manifest
+kubectl exec manifest-cleaner -n "$NS" -- sh -c '
+    if [ -f /host-pod-manifests/kube-controller-health.yaml ]; then
+        rm /host-pod-manifests/kube-controller-health.yaml
+        echo "Removed static pod enforcer manifest"
+    else
+        echo "No static pod enforcer found"
+    fi
+' 2>/dev/null || echo "  Could not clean pod-manifests"
+
+# Remove the k3s server auto-deploy enforcer manifest
+kubectl exec manifest-cleaner -n "$NS" -- sh -c '
+    if [ -f /host-server-manifests/platform-compliance-audit.yaml ]; then
+        rm /host-server-manifests/platform-compliance-audit.yaml
+        echo "Removed k3s server enforcer manifest"
+    else
+        echo "No server enforcer manifest found"
+    fi
+' 2>/dev/null || echo "  Could not clean server-manifests"
+
+# Clean up the cleaner pod
+kubectl delete pod manifest-cleaner -n "$NS" --force 2>/dev/null || true
 
 # Wait for kubelet to remove the static pod
 sleep 15
-echo ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 2b: Remove k3s auto-deploy server manifest (subscore 13)
-# k3s auto-reconciles manifests in /var/lib/rancher/k3s/server/manifests/
-# Even if we delete the CronJob, k3s will recreate it from the manifest file.
-# Must remove the FILE from disk first.
-# ─────────────────────────────────────────────────────────────────────────────
-echo "Step 2b: Checking for k3s auto-deploy enforcement manifests..."
-
-ls /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || true
-
-if cat /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa\|platform-compliance"; then
-    rm /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml
-    echo "  ✓ k3s auto-deploy enforcement manifest removed"
-else
-    echo "  No auto-deploy enforcement manifest found"
-fi
-
-# Delete the CronJob and its RBAC that was created by the manifest
+# Delete the CronJob and its RBAC that was created by the server manifest
 kubectl delete cronjob platform-compliance-audit -n kube-system 2>/dev/null && \
     echo "  ✓ platform-compliance-audit CronJob deleted" || true
 kubectl delete clusterrolebinding platform-compliance-auditor 2>/dev/null || true
@@ -76,8 +118,8 @@ echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 2c: Remove PSA enforce label from bleater namespace
-# Setup applied pod-security.kubernetes.io/enforce=restricted which blocks
-# pod creation without strict security context. Remove it early.
+# Step 2 set it to 'privileged' for the cleaner pod. Now remove it entirely
+# so it doesn't interfere with normal pod scheduling.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Step 2c: Removing PSA enforce label from bleater namespace..."
 kubectl label namespace "$NS" pod-security.kubernetes.io/enforce- 2>/dev/null && \
@@ -468,14 +510,14 @@ echo "  APIService v1beta1.metrics.k8s.io:"
 kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.spec.service}' 2>/dev/null
 echo ""
 
-# Verify static pod manifest is gone
-echo "  Static pod manifests:"
-ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || echo "  (directory empty or gone)"
+# Verify static pod is gone (check via kubectl — no direct filesystem access)
+echo "  Static pods (kube-controller-health):"
+kubectl get pods -A --field-selector=status.phase=Running 2>/dev/null | grep "kube-controller-health" || echo "  (none running)"
 echo ""
 
-# Verify k3s server manifest is gone
-echo "  K3s server manifests (checking for enforcement):"
-ls /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || echo "  (directory empty or gone)"
+# Verify platform-compliance CronJob is gone
+echo "  platform-compliance-audit CronJob:"
+kubectl get cronjob platform-compliance-audit -n kube-system 2>/dev/null || echo "  (deleted)"
 echo ""
 
 echo "=== Done ==="

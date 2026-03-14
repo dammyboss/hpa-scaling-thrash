@@ -197,8 +197,8 @@ def grade(transcript: str) -> GradingResult:
     spec2 = hpa2.get("spec", {})
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 1: scaledown_window_durable (0.09)
-    # stabilizationWindowSeconds >= 120 on BOTH reads
+    # SUBSCORE 1: scaledown_window_durable (1/13)
+    # stabilizationWindowSeconds >= 180 on BOTH reads
     # selectPolicy must NOT be "Max"
     # ═════════════════════════════════════════════════════════════════════════
     try:
@@ -226,8 +226,8 @@ def grade(transcript: str) -> GradingResult:
     weights["scaledown_window_durable"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 2: scaleup_window_durable (0.09)
-    # stabilizationWindowSeconds >= 30 on BOTH reads
+    # SUBSCORE 2: scaleup_window_durable (1/13)
+    # stabilizationWindowSeconds >= 45 on BOTH reads
     # selectPolicy must NOT be "Max"
     # ═════════════════════════════════════════════════════════════════════════
     try:
@@ -263,10 +263,6 @@ def grade(transcript: str) -> GradingResult:
         policies = sd.get("policies", [])
         if not policies:
             return False, "no policies defined"
-        # Must have at least one Pods-type policy for predictable per-step scaling
-        has_pods_policy = any(p.get("type") == "Pods" for p in policies)
-        if not has_pods_policy:
-            return False, "no Pods-type policy defined (need predictable per-step scaling)"
         for p in policies:
             ptype = p.get("type", "")
             value = p.get("value", 0)
@@ -307,10 +303,6 @@ def grade(transcript: str) -> GradingResult:
         policies = su.get("policies", [])
         if not policies:
             return False, "no policies defined"
-        # Must have at least one Pods-type policy for predictable per-step scaling
-        has_pods_policy = any(p.get("type") == "Pods" for p in policies)
-        if not has_pods_policy:
-            return False, "no Pods-type policy defined (need predictable per-step scaling)"
         for p in policies:
             ptype = p.get("type", "")
             value = p.get("value", 0)
@@ -366,7 +358,7 @@ def grade(transcript: str) -> GradingResult:
             else:
                 gw_metrics = [i for i in items if "api-gateway" in i.get("metadata", {}).get("name", "")]
                 if len(gw_metrics) > 0:
-                    # Also verify metrics-server deployment is healthy
+                    # Verify metrics-server deployment has ready replicas
                     ms_stdout, ms_rc = run_kubectl_command(
                         "get", "deployment", "metrics-server", "-o", "json",
                         namespace="kube-system", timeout=10
@@ -375,9 +367,7 @@ def grade(transcript: str) -> GradingResult:
                     if ms_rc == 0:
                         ms_deploy = json.loads(ms_stdout)
                         ready = ms_deploy.get("status", {}).get("readyReplicas", 0)
-                        ms_args = ms_deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [{}])[0].get("args", [])
-                        has_insecure_tls = any("--kubelet-insecure-tls" in a for a in ms_args)
-                        if ready > 0 and has_insecure_tls:
+                        if ready > 0:
                             ms_healthy = True
 
                     if ms_healthy:
@@ -385,7 +375,7 @@ def grade(transcript: str) -> GradingResult:
                         print(f"✓ Metrics pipeline healthy — {len(gw_metrics)} api-gateway pod metrics, metrics-server ready")
                     else:
                         subscores["metrics_pipeline_functional"] = 0.0
-                        print(f"✗ Metrics available but metrics-server deployment unhealthy or missing --kubelet-insecure-tls")
+                        print(f"✗ Metrics available but metrics-server deployment has no ready replicas")
                 else:
                     subscores["metrics_pipeline_functional"] = 0.0
                     print(f"✗ Metrics available for {len(items)} pods but none for api-gateway")

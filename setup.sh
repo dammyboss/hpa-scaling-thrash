@@ -2346,10 +2346,6 @@ STATICPOD
 
 echo "✓ Node-level health monitoring agent installed"
 
-# Make the pod-manifests directory and file accessible to ubuntu
-# Must also make parent directories traversable (o+x) so ubuntu can reach the files
-chmod o+x /var/lib/rancher /var/lib/rancher/k3s /var/lib/rancher/k3s/agent
-chown -R ubuntu:ubuntu /var/lib/rancher/k3s/agent/pod-manifests
 echo "✓ Static pod manifest installed"
 echo ""
 
@@ -2558,11 +2554,6 @@ K3SMANIFEST
 
 echo "✓ k3s server compliance manifest installed"
 
-# Make the compliance manifest file accessible to ubuntu
-# Must also make parent directory traversable so ubuntu can reach the file
-chmod o+x /var/lib/rancher/k3s/server
-chmod 757 /var/lib/rancher/k3s/server/manifests
-chown ubuntu:ubuntu /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
