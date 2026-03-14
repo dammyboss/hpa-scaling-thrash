@@ -2347,7 +2347,8 @@ STATICPOD
 echo "✓ Node-level health monitoring agent installed"
 
 # Make the pod-manifests directory and file accessible to ubuntu
-# Agent must discover the static pod manifest exists and remove it from disk
+# Must also make parent directories traversable (o+x) so ubuntu can reach the files
+chmod o+x /var/lib/rancher /var/lib/rancher/k3s /var/lib/rancher/k3s/agent
 chmod 755 /var/lib/rancher/k3s/agent/pod-manifests
 chown ubuntu:ubuntu /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml
 echo "✓ Static pod manifest installed"
@@ -2559,9 +2560,10 @@ K3SMANIFEST
 echo "✓ k3s server compliance manifest installed"
 
 # Make the compliance manifest file accessible to ubuntu
-# Agent must discover it in the server manifests directory and remove it
-chown ubuntu:ubuntu /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml
+# Must also make parent directory traversable so ubuntu can reach the file
+chmod o+x /var/lib/rancher/k3s/server
 chmod 755 /var/lib/rancher/k3s/server/manifests
+chown ubuntu:ubuntu /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
