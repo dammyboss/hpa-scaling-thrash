@@ -131,7 +131,7 @@ def grade(transcript: str) -> GradingResult:
     """
     Grade the agent's solution for HPA scaling thrash fix (hard mode).
 
-    12 subscores, each tested FUNCTIONALLY with a durability window.
+    13 subscores, each tested FUNCTIONALLY with a durability window.
     Two HPA reads 70s apart — values must be correct on BOTH reads.
 
     Subscores:
@@ -255,7 +255,7 @@ def grade(transcript: str) -> GradingResult:
     weights["scaleup_window_durable"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 3: scaledown_policy_conservative (0.09)
+    # SUBSCORE 3: scaledown_policy_conservative (1/13)
     # No Percent policy >30% in <60s, no Pods policy >3 in <60s
     # Must pass on BOTH reads
     # ═════════════════════════════════════════════════════════════════════════
@@ -295,7 +295,7 @@ def grade(transcript: str) -> GradingResult:
     weights["scaledown_policy_conservative"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 4: scaleup_policy_conservative (0.09)
+    # SUBSCORE 4: scaleup_policy_conservative (1/13)
     # No Percent policy >100% in <30s, no Pods policy >4 in <30s
     # Must pass on BOTH reads
     # ═════════════════════════════════════════════════════════════════════════
@@ -335,7 +335,7 @@ def grade(transcript: str) -> GradingResult:
     weights["scaleup_policy_conservative"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 5: metrics_pipeline_functional (0.09)
+    # SUBSCORE 5: metrics_pipeline_functional (1/13)
     # metrics-server returns fresh pod-level data for bleater namespace
     # ═════════════════════════════════════════════════════════════════════════
     try:
@@ -386,7 +386,7 @@ def grade(transcript: str) -> GradingResult:
     weights["metrics_pipeline_functional"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 6: cpu_target_appropriate (0.09)
+    # SUBSCORE 6: cpu_target_appropriate (1/13)
     # CPU averageUtilization between 40-80%
     # No extra memory metric defined
     # Must pass on BOTH reads
@@ -437,7 +437,7 @@ def grade(transcript: str) -> GradingResult:
     weights["cpu_target_appropriate"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 7: deployment_resources_valid (0.09)
+    # SUBSCORE 7: deployment_resources_valid (1/13)
     # CPU request >= 50m, CPU limit >= 200m
     # ═════════════════════════════════════════════════════════════════════════
     try:
@@ -498,7 +498,7 @@ def grade(transcript: str) -> GradingResult:
     weights["deployment_resources_valid"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 8: hpa_replica_range_sane (0.08)
+    # SUBSCORE 8: hpa_replica_range_sane (1/13)
     # minReplicas 2-5, maxReplicas 8-15
     # No duplicate HPAs targeting bleater-api-gateway
     # Must pass on BOTH reads
@@ -541,7 +541,7 @@ def grade(transcript: str) -> GradingResult:
     weights["hpa_replica_range_sane"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 9: hpa_currently_computing (0.05)
+    # SUBSCORE 9: hpa_currently_computing (1/13)
     # HPA ScalingActive condition is True
     # currentMetrics shows actual CPU utilization (not <unknown>)
     # Retry up to 3 times — HPA controller may need a few cycles after cleanup
@@ -596,7 +596,7 @@ def grade(transcript: str) -> GradingResult:
     weights["hpa_currently_computing"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 10: limitrange_not_blocking (0.08)
+    # SUBSCORE 10: limitrange_not_blocking (1/13)
     # The LimitRange 'bleater-resource-governance' in bleater namespace
     # has max.cpu=20m which blocks setting proper deployment resources.
     # It must be deleted or modified to allow cpu >= 50m.
@@ -644,7 +644,7 @@ def grade(transcript: str) -> GradingResult:
     weights["limitrange_not_blocking"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 11: apiservice_correctly_configured (0.08)
+    # SUBSCORE 11: apiservice_correctly_configured (1/13)
     # The APIService v1beta1.metrics.k8s.io must point to the correct
     # service (metrics-server) in kube-system. If it points to a wrong
     # service name, the API server can't proxy metrics requests.
@@ -677,7 +677,7 @@ def grade(transcript: str) -> GradingResult:
     weights["apiservice_correctly_configured"] = 1/13
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 12: static_pod_enforcer_removed (0.08)
+    # SUBSCORE 12: static_pod_enforcer_removed (1/13)
     # A static pod manifest at /var/lib/rancher/k3s/agent/pod-manifests/
     # continuously reverts HPA config and recreates deleted CronJobs.
     # Static pods can't be deleted via kubectl — the manifest file must
