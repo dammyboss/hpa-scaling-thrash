@@ -23,9 +23,8 @@ prompt: |
   The root causes span multiple areas and may involve the HPA configuration, the metrics pipeline,
   workload resource definitions, and possibly other mechanisms that enforce or revert configuration changes.
 
-  The team has documented scaling standards somewhere in the platform documentation. Check the Gitea wiki,
-  Mattermost channels, and Gitea issues for context on what happened and what the correct values should be.
-  Be careful — not all documentation sources may be up to date or consistent with each other.
+  The platform team maintains scaling policy ConfigMaps in the bleater namespace. Start by reviewing
+  these ConfigMaps for the team's scaling standards and configuration baselines.
 
   Verify the fix by ensuring:
   - The HPA is no longer thrashing and meets the team's production scaling standards

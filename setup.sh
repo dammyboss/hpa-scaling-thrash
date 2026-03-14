@@ -56,34 +56,48 @@ echo "✓ Workload resource profiles adjusted"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Decoy ConfigMaps in bleater namespace
-# These look important but do nothing — waste agent investigation time
+# Step 3: ConfigMap Chain — ALL values wrong, each vaguely points to next
+# Strategy: task.yaml sends agents here. Every CM has plausible-looking but
+# WRONG values. Each uses slightly different field naming. Each vaguely
+# references the next CM. The last one is a dry changelog with no forward
+# pointer. Correct values are ONLY in Mattermost noise and wiki pages
+# that agents must discover on their own.
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Step 3: Creating platform policy ConfigMaps..."
 
 kubectl apply -f - <<EOF
+# ── CM 1: hpa-scaling-config — FIRST STOP (task.yaml sends agents here) ──────
+# All wrong: 150s/30s windows, 35% target, 40m request, 150m limit, Disabled policy, 1 min replica
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: hpa-policy-config
+  name: hpa-scaling-config
   namespace: $NS
   labels:
     app.kubernetes.io/managed-by: platform-ops
     app.kubernetes.io/component: autoscaling-policy
   annotations:
-    platform-ops.io/description: "HPA behavior thresholds — applied by policy-enforcer"
-    platform-ops.io/last-sync: "2026-02-28T14:30:00Z"
+    platform-ops.io/description: "HPA scaling configuration — production approved thresholds"
+    platform-ops.io/last-updated: "2026-02-28T14:30:00Z"
+    platform-ops.io/approved-by: "Platform Operations Team"
 data:
-  # Uses "window" (not "stabilization") — plausible but different naming convention
-  scaledown_window_seconds: "10"
-  scaleup_window_seconds: "0"
-  scaledown_percent_per_cycle: "60"
-  scaledown_period_seconds: "10"
-  scaleup_percent_per_cycle: "150"
-  scaleup_period_seconds: "10"
-  cpu_utilization_threshold: "5"
-  select_policy_mode: "Max"
+  scaleDown.stabilization_Window_Seconds: "150"
+  scaleUp.stabilization_Window_Seconds: "30"
+  scaleDown.select_Policy: "Disabled"
+  scaleUp.select_Policy: "Disabled"
+  cpu.average_Utilization: "35"
+  resources.requests_cpu: "40m"
+  resources.limits_cpu: "150m"
+  min_Replicas: "1"
+  max_Replicas: "20"
+  scaleDown.policies.percent_Value: "50"
+  scaleDown.policies.period_Seconds: "30"
+  scaleUp.policies.percent_Value: "150"
+  scaleUp.policies.period_Seconds: "30"
+  notes: "Production scaling thresholds for bleater API services. Service-specific tuning overrides are maintained separately in hpa-tuning-params."
 ---
+# ── CM 2: hpa-tuning-params — SECOND STOP ────────────────────────────────────
+# Different naming convention, different wrong values. Vaguely references sre-scaling-baseline.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -93,20 +107,24 @@ metadata:
     app.kubernetes.io/managed-by: platform-ops
     app.kubernetes.io/component: autoscaling-tuning
   annotations:
-    platform-ops.io/description: "Production tuning parameters — do not modify without approval"
+    platform-ops.io/description: "Service-level tuning parameters — api-gateway specific overrides"
+    platform-ops.io/last-updated: "2026-02-20T09:15:00Z"
 data:
-  # Uses "tuning" terminology — sounds like it's the config being applied
-  cpu_target_pct: "5"
-  replicas_minimum: "1"
-  replicas_maximum: "25"
-  cooldown_interval_sec: "300"
-  burst_scale_factor: "1.5"
-  memory_utilization_pct: "3"
-EOF
-
-# SRE baseline ConfigMap — looks authoritative but has STALE Q3 values
-# Agent must cross-reference against the wiki (which has the updated Q1 2026 values)
-kubectl apply -f - <<EOF
+  behavior.scaleDown.stabilization_window_seconds: "120"
+  behavior.scaleUp.stabilization_window_seconds: "20"
+  behavior.select_policy: "Max"
+  metrics.resource.cpu.target_average_utilization: "30"
+  container.resources.request_cpu: "30m"
+  container.resources.limit_cpu: "100m"
+  spec.min_replicas: "1"
+  spec.max_replicas: "25"
+  metrics.resource.memory.enabled: "true"
+  metrics.resource.memory.target_average_utilization: "3"
+  notes: "Api-gateway tuning overrides. Baselines and approval history are tracked in the sre-scaling-baseline resource."
+---
+# ── CM 3: sre-scaling-baseline — THIRD STOP (most authoritative-looking) ─────
+# Looks like THE official source. Dated recently, status ACTIVE, SRE approved.
+# ALL values wrong but plausible. Vaguely references platform-ops-changelog.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -116,61 +134,26 @@ metadata:
     app.kubernetes.io/managed-by: sre-team
     app.kubernetes.io/component: scaling-standards
   annotations:
-    sre.bleater.io/description: "Production scaling baseline — Q3 2025 approved values"
+    sre.bleater.io/description: "Production scaling baseline — current approved values"
     sre.bleater.io/approved-by: "SRE Leadership"
-    sre.bleater.io/approved-date: "2025-09-15"
-    sre.bleater.io/status: "SUPERSEDED — see SRE-Scaling-Standards wiki for current values"
+    sre.bleater.io/approved-date: "2026-02-28"
+    sre.bleater.io/status: "ACTIVE"
 data:
-  # Subtly different field names — "recommended" vs actual minimums
-  scaledown_stabilization_recommended: "120"
-  scaleup_stabilization_recommended: "30"
-  select_policy_default: "Disabled"
-  cpu_target_baseline: "30"
-  cpu_target_ceiling: "70"
-  cpu_request_baseline: "25m"
-  cpu_limit_baseline: "100m"
-  min_replicas_default: "1"
-  max_replicas_default: "20"
-  scaledown_percent_ceiling: "50"
-  scaleup_percent_ceiling: "200"
-  notes: "Q3 2025 recommended baselines. These are starting-point defaults, not hard minimums. For current mandatory minimums, check the SRE-Scaling-Standards wiki page."
+  scaleDown.stabilizationWindow_Seconds: "150"
+  scaleUp.stabilizationWindow_Seconds: "35"
+  behavior.selectPolicy: "Disabled"
+  cpu.averageUtilization_min: "30"
+  cpu.averageUtilization_max: "75"
+  resources.requests_cpu_min: "40m"
+  resources.limits_cpu_min: "150m"
+  minReplicas_range: "1-3"
+  maxReplicas_range: "10-20"
+  scaleDown.percent_max_per_60s: "40"
+  scaleUp.percent_max_per_60s: "120"
+  notes: "Approved production baselines. For change history refer to the platform-ops-changelog."
 ---
-# Decoy ConfigMap — Q4 review recommendations that CONTRADICT the correct SRE standards
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: hpa-scaling-review-q4
-  namespace: $NS
-  labels:
-    app.kubernetes.io/managed-by: sre-team
-    app.kubernetes.io/component: scaling-review
-  annotations:
-    sre.bleater.io/description: "Q4 2025 scaling review — proposed changes (NOT YET APPROVED)"
-    sre.bleater.io/review-status: "pending-approval"
-    sre.bleater.io/reviewer: "Platform Architecture Board"
-data:
-  # Uses "target" and "threshold" — sounds authoritative, values are wrong
-  scaledown_stabilization_target: "300"
-  scaleup_stabilization_target: "30"
-  scaledown_select_policy: "Min"
-  scaleup_select_policy: "Max"
-  cpu_utilization_target: "65"
-  cpu_request_threshold: "100m"
-  cpu_limit_threshold: "500m"
-  min_replicas_target: "3"
-  max_replicas_target: "20"
-  proposal_notes: |
-    Q4 Scaling Review Recommendations (DRAFT — pending approval):
-    - selectPolicy: use Min for scaleDown (conservative) and Max for scaleUp (responsive)
-    - scaleDown stabilization: increase to 300s for maximum stability
-    - scaleUp stabilization: keep at 30s for fast burst response
-    - CPU target: 65% (single value, not a range — simplifies tuning)
-    - CPU request: 100m minimum, limit: 500m minimum (higher than Q3)
-    - NOTE: Do NOT use selectPolicy: Disabled — it prevents ALL scaling
-  status: "DRAFT — awaiting Platform Architecture Board sign-off"
-  notes: "These are PROPOSED changes and may conflict with current SRE standards. Do not apply until approved."
----
-# Navigation ConfigMap — points to various sources, adds confusion
+# ── CM 4: platform-ops-changelog — FOURTH STOP (dry changelog, no pointers) ──
+# Just dates and events. Does NOT mention wiki, Mattermost, or any external source.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -180,21 +163,66 @@ metadata:
     app.kubernetes.io/managed-by: platform-ops
     app.kubernetes.io/component: changelog
   annotations:
-    platform-ops.io/description: "Platform operations change log — tracks policy updates"
+    platform-ops.io/description: "Platform operations change log"
 data:
   latest_entry: "2026-03-01"
   changelog: |
-    2026-03-01: Updated SRE-Scaling-Standards wiki with post-incident values (INC-2025-0391)
-    2026-02-28: Deployed enforcement CronJobs to kube-ops, bleater-env, default namespaces
+    2026-03-01: Post-incident review completed for INC-2025-0391. Revised thresholds circulated to teams.
+    2026-02-28: Deployed enforcement CronJobs to operational namespaces
+    2026-02-20: Api-gateway tuning parameters updated in hpa-tuning-params
     2026-02-15: Started v2 HPA migration (bleater-gateway-scaling-v2)
-    2026-01-15: SRE Leadership approved new scaling standards (supersedes Q3 baselines)
-    2025-09-15: Q3 baseline ConfigMap (sre-scaling-baseline) deployed
-  notes: |
-    The sre-scaling-baseline ConfigMap contains Q3 2025 values and is OUTDATED.
-    Current approved values are on the SRE-Scaling-Standards wiki page (updated 2026-03-01).
-    For enforcement architecture details, see Platform-Operations-Framework wiki.
-    For real-time status, check Mattermost #platform-ops channel.
+    2026-01-15: SRE Leadership approved revised scaling standards after Q4 incident post-mortem
+    2025-09-15: Initial baseline ConfigMap deployed
+---
+# ── CM 5: hpa-scaling-review-q4 — DEAD END (yet another set of wrong values) ──
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hpa-scaling-review-q4
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: sre-team
+    app.kubernetes.io/component: scaling-review
+  annotations:
+    sre.bleater.io/description: "Q4 2025 scaling review — proposed adjustments"
+    sre.bleater.io/review-status: "pending-approval"
+data:
+  scaleDown.stabilization_Window: "300"
+  scaleUp.stabilization_Window: "20"
+  scaleDown.selectPolicy: "Disabled"
+  scaleUp.selectPolicy: "Max"
+  cpu.average_utilization: "25"
+  resources.request_cpu: "20m"
+  resources.limit_cpu: "80m"
+  spec.minReplicas: "1"
+  spec.maxReplicas: "30"
+  status: "DRAFT — awaiting sign-off"
+---
+# ── CM 6: hpa-policy-config — enforcement values (obviously broken) ───────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hpa-policy-config
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: autoscaling-policy
+  annotations:
+    platform-ops.io/description: "HPA policy enforcement configuration"
+    platform-ops.io/last-sync: "2026-03-10T08:00:00Z"
+data:
+  behavior.scaleDown.stabilizationWindowSec: "10"
+  behavior.scaleUp.stabilizationWindowSec: "0"
+  behavior.scaleDown.policy.percent: "60"
+  behavior.scaleUp.policy.percent: "150"
+  metrics.cpu.averageUtilization_target: "5"
+  behavior.scaleDown.select_Policy: "Max"
+  behavior.scaleUp.select_Policy: "Max"
+  notes: "Active enforcement values. Managed by platform-ops drift-correction system."
 EOF
+
+echo "✓ ConfigMaps created"
+echo ""
 
 echo "✓ ConfigMaps created"
 echo ""
@@ -3199,14 +3227,317 @@ curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
     -d "{\"title\":\"Metrics-Server-Architecture\",\"content_base64\":\"$(echo "$WIKI6" | base64 -w0)\"}" \
     2>/dev/null && echo "  Wiki: Metrics-Server-Architecture" || true
 
-# ── WIKI PAGE 7: SRE Scaling Standards (KEY — correct thresholds but buried in narrative) ──
-WIKI7=$(cat <<'WIKICONTENT'
+# ── WIKI PAGE 7: Team Onboarding Guide (NOISE) ──────────────────────────────
+WIKI7_NOISE1=$(cat <<'WIKICONTENT'
+## New Team Member Onboarding Guide
+
+### Welcome to Bleater Platform Engineering!
+
+Congratulations on joining the team! This page covers everything you need to get started.
+
+### First Week Checklist
+- [ ] Get badge access from Security desk (Building C, ground floor)
+- [ ] Set up your laptop with IT (ticket to helpdesk@bleater.io)
+- [ ] Join Mattermost channels: #general, #platform-ops, #random, #lunch-orders
+- [ ] Get added to PagerDuty on-call rotation (talk to your manager)
+- [ ] Complete mandatory security awareness training (link in welcome email)
+- [ ] Set up VPN access for remote work (instructions on intranet)
+
+### Development Environment Setup
+1. Clone the main repos from Gitea
+2. Install kubectl, helm, and k9s
+3. Get kubeconfig from your team lead
+4. Verify access to staging cluster
+
+### Key Contacts
+| Role | Person | Email |
+|------|--------|-------|
+| Engineering Manager | David Liu | david.liu@bleater.io |
+| Platform Lead | Sarah Chen | sarah.chen@bleater.io |
+| SRE Lead | Marcus Rivera | marcus.r@bleater.io |
+| DevEx Lead | Priya Sharma | priya.s@bleater.io |
+
+### Office Logistics
+- Kitchen is on 2nd floor, coffee machine on every floor
+- Parking: Lot B (badge required), street parking on Elm St is free after 6pm
+- Gym membership discount: talk to HR
+- Book clubs meet every other Thursday in the 3rd floor lounge
+
+### Useful Links
+- Intranet: http://intranet.bleater.io
+- Benefits portal: http://benefits.bleater.io
+- IT Helpdesk: helpdesk@bleater.io
+- Expense reports: http://expenses.bleater.io
+
+---
+*Last updated: 2026-02-01 by People Operations*
+WIKICONTENT
+)
+
+curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
+    -H "Content-Type: application/json" \
+    -d "{\"title\":\"Team-Onboarding-Guide\",\"content_base64\":\"$(echo "$WIKI7_NOISE1" | base64 -w0)\"}" \
+    2>/dev/null && echo "  Wiki: Team-Onboarding-Guide" || true
+
+# ── WIKI PAGE 8: Meeting Notes Q1 2026 (NOISE) ──────────────────────────────
+WIKI8_NOISE2=$(cat <<'WIKICONTENT'
+## Platform Team Meeting Notes — Q1 2026
+
+### 2026-03-07 — Weekly Sync
+
+**Attendees**: Sarah, Marcus, Priya, Alex, David
+
+**Updates**:
+- Marcus: Grafana 10 migration is 80% complete. Need to migrate 4 more dashboards.
+- Sarah: Working on the compliance enforcement rollout. CronJobs are deployed across kube-ops, bleater-env, and default namespaces.
+- Priya: CI pipeline improvements — build times down 30% after switching to depot runners.
+- Alex: Still ramping up on the notification service. Found some interesting patterns in the message queue.
+
+**Action Items**:
+- [ ] Marcus to finish Grafana migration by EOW
+- [ ] Sarah to document the enforcement architecture
+- [ ] Priya to investigate flaky integration tests
+- [ ] Alex to shadow Marcus on next on-call shift
+
+**Discussion**:
+- Team agreed to switch from biweekly to weekly architecture reviews
+- Budget for Q2 training approved — everyone pick a conference by March 20
+- Office snack budget increased — submit requests to #random channel
+
+---
+
+### 2026-02-28 — Weekly Sync
+
+**Attendees**: Sarah, Marcus, Priya, David
+
+**Updates**:
+- Sarah: API gateway autoscaling has been acting up since the enforcement rollout. Looking into it.
+- Marcus: Database connection pool tuning complete for the user service. Reduced p99 from 340ms to 180ms.
+- Priya: Deployed new Terraform modules for Redis cluster provisioning.
+
+**Action Items**:
+- [ ] Sarah to investigate the scaling issues
+- [ ] Marcus to document connection pool settings
+- [ ] David to review team capacity for Q2 planning
+
+**Discussion**:
+- Talked about moving to ArgoCD for GitOps. Decision deferred to Q2 planning.
+- The office move to Building D is confirmed for April. Start packing personal items.
+- Team lunch at the Thai place was excellent. Will go again.
+
+---
+
+### 2026-02-21 — Weekly Sync
+
+**Attendees**: Sarah, Marcus, Priya, David
+
+**Updates**:
+- Marcus: On-call was quiet this week. One alert for disk space on logging node (resolved).
+- Sarah: Rolled out the new compliance CronJobs to staging. Planning production deployment next week.
+- Priya: Fixed the flaky CI tests — was a timing issue with database seeding.
+
+**Action Items**:
+- [ ] Sarah to prepare production rollout plan for enforcement CronJobs
+- [ ] Marcus to set up new Grafana alerts for disk usage
+- [ ] Priya to update CI documentation
+
+---
+*This page is maintained by the Platform Team secretary rotation*
+WIKICONTENT
+)
+
+curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
+    -H "Content-Type: application/json" \
+    -d "{\"title\":\"Meeting-Notes-Q1-2026\",\"content_base64\":\"$(echo "$WIKI8_NOISE2" | base64 -w0)\"}" \
+    2>/dev/null && echo "  Wiki: Meeting-Notes-Q1-2026" || true
+
+# ── WIKI PAGE 9: Office Policies and Procedures (NOISE) ─────────────────────
+WIKI9_NOISE3=$(cat <<'WIKICONTENT'
+## Office Policies and Procedures
+
+### Remote Work Policy
+- Engineers can work remotely up to 3 days per week
+- Core hours: 10am - 4pm local time (for meeting availability)
+- VPN must be connected when accessing internal systems remotely
+- On-call engineers must be within 15 minutes of laptop access
+
+### On-Call Rotation
+- Rotations are managed in PagerDuty
+- Primary and secondary on-call per team
+- Escalation path: Primary → Secondary → Team Lead → Engineering Manager
+- Post-incident review required for all P1/P2 incidents within 48 hours
+
+### Code Review Standards
+- All PRs require at least 2 approvals
+- Security-sensitive changes require security team review
+- Infrastructure changes require platform team review
+- Maximum PR size: 500 lines (break larger changes into smaller PRs)
+
+### Incident Classification
+| Priority | Response Time | Example |
+|----------|--------------|---------|
+| P1 | 15 minutes | Production outage, data loss |
+| P2 | 1 hour | Degraded service, partial outage |
+| P3 | 4 hours | Non-critical feature broken |
+| P4 | Next business day | Cosmetic issues, minor bugs |
+
+### Expense Policy
+- Conference attendance: pre-approval required from manager
+- Software licenses: up to $100/month without approval
+- Hardware: submit request through IT portal
+- Team dinners: $50/person limit
+
+### Communication Channels
+- **Urgent issues**: PagerDuty
+- **Team coordination**: Mattermost
+- **Documentation**: Gitea Wiki
+- **Project tracking**: Jira
+- **Code**: Gitea
+
+---
+*Last updated: 2026-01-15 by Engineering Management*
+WIKICONTENT
+)
+
+curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
+    -H "Content-Type: application/json" \
+    -d "{\"title\":\"Office-Policies-and-Procedures\",\"content_base64\":\"$(echo "$WIKI9_NOISE3" | base64 -w0)\"}" \
+    2>/dev/null && echo "  Wiki: Office-Policies-and-Procedures" || true
+
+# ── WIKI PAGE 10: Architecture Decision Records (NOISE with slight misdirection) ──
+WIKI10_NOISE4=$(cat <<'WIKICONTENT'
+## Architecture Decision Records (ADRs)
+
+### ADR-001: Adopt k3s for Development Clusters
+**Date**: 2025-06-15
+**Status**: Accepted
+**Context**: Need lightweight Kubernetes for dev/staging environments.
+**Decision**: Use k3s instead of full k8s for non-production clusters.
+**Consequences**: Reduced infrastructure costs, simplified maintenance.
+
+### ADR-002: Microservices Communication via gRPC
+**Date**: 2025-07-20
+**Status**: Accepted
+**Context**: REST APIs between services are becoming a bottleneck.
+**Decision**: Adopt gRPC for inter-service communication, keep REST for external APIs.
+**Consequences**: Better performance, but requires proto file management.
+
+### ADR-003: Centralized Configuration Management
+**Date**: 2025-09-01
+**Status**: Accepted
+**Context**: Configuration drift across environments is causing incidents.
+**Decision**: Use ConfigMaps as the primary configuration source, with CronJob-based enforcement for compliance.
+**Consequences**: More consistent environments, but teams need to coordinate config changes through platform-ops.
+
+### ADR-004: Horizontal Pod Autoscaling Strategy
+**Date**: 2025-10-15
+**Status**: Superseded by ADR-007
+**Context**: Services need automatic scaling based on load.
+**Decision**: Use CPU-based HPA with aggressive scaling (selectPolicy: Max, short stabilization windows).
+**Consequences**: Fast response to load spikes, but causes scaling thrash under variable load.
+
+### ADR-005: Observability Stack Selection
+**Date**: 2025-11-01
+**Status**: Accepted
+**Context**: Need unified observability across all services.
+**Decision**: Grafana + Prometheus + Loki stack.
+**Consequences**: Open source, well-supported, integrates with Kubernetes natively.
+
+### ADR-006: Database Per Service Pattern
+**Date**: 2025-11-20
+**Status**: Accepted
+**Context**: Shared databases are creating coupling between services.
+**Decision**: Each service owns its database. No cross-service database access.
+**Consequences**: Better isolation, but increased infrastructure cost and complexity.
+
+### ADR-007: Revised HPA Scaling Strategy (Post-Incident)
+**Date**: 2026-01-10
+**Status**: Accepted (supersedes ADR-004)
+**Context**: Q4 2025 scaling incident (INC-2025-0391) demonstrated that aggressive autoscaling causes cascading failures.
+**Decision**: Adopt conservative scaling with stability-first approach. Details in SRE scaling policy documentation.
+**Consequences**: Slower response to traffic spikes (acceptable per SLA), significantly reduced scaling thrash.
+
+### ADR-008: GitOps Workflow Evaluation
+**Date**: 2026-02-15
+**Status**: Proposed
+**Context**: Manual deployments are error-prone and slow.
+**Decision**: Evaluate ArgoCD for GitOps-based deployments in Q2 2026.
+**Consequences**: TBD — pending evaluation.
+
+---
+*ADRs are numbered sequentially. Superseded ADRs are kept for historical context.*
+WIKICONTENT
+)
+
+curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
+    -H "Content-Type: application/json" \
+    -d "{\"title\":\"Architecture-Decision-Records\",\"content_base64\":\"$(echo "$WIKI10_NOISE4" | base64 -w0)\"}" \
+    2>/dev/null && echo "  Wiki: Architecture-Decision-Records" || true
+
+# ── WIKI PAGE 11: Service Catalog (NOISE) ────────────────────────────────────
+WIKI11_NOISE5=$(cat <<'WIKICONTENT'
+## Bleater Service Catalog
+
+### Production Services
+
+| Service | Namespace | Owner | Port | Health Endpoint |
+|---------|-----------|-------|------|-----------------|
+| bleater-api-gateway | bleater | platform-ops | 8080 | /healthz |
+| bleater-user-service | bleater | backend | 8081 | /health |
+| bleater-bleat-service | bleater | backend | 8082 | /health |
+| bleater-timeline-service | bleater | backend | 8083 | /health |
+| bleater-notification-service | bleater | backend | 8084 | /health |
+| bleater-search-service | bleater | search-team | 9200 | /_cluster/health |
+| bleater-media-service | bleater | media-team | 8085 | /health |
+| bleater-auth-service | bleater | security | 8086 | /health |
+
+### Infrastructure Services
+
+| Service | Namespace | Owner | Description |
+|---------|-----------|-------|-------------|
+| postgresql | bleater | dba-team | Primary database |
+| redis | bleater | platform-ops | Session cache and rate limiting |
+| rabbitmq | bleater | platform-ops | Async message queue |
+| metrics-server | kube-system | platform-ops | Resource metrics |
+| gitea | gitea | devex | Source control |
+| grafana | monitoring | platform-ops | Dashboards and alerting |
+| mattermost | mattermost | devex | Team communication |
+
+### SLA Targets
+
+| Tier | Availability | Latency (p99) | Examples |
+|------|-------------|---------------|----------|
+| Tier 1 | 99.95% | < 200ms | api-gateway, auth-service |
+| Tier 2 | 99.9% | < 500ms | user-service, bleat-service |
+| Tier 3 | 99.5% | < 2s | search, media-service |
+
+### Dependency Map
+```
+Client → api-gateway → auth-service
+                     → user-service → postgresql
+                     → bleat-service → postgresql, rabbitmq
+                     → timeline-service → postgresql, redis
+                     → notification-service → rabbitmq
+                     → search-service → elasticsearch
+                     → media-service → object-storage
+```
+
+---
+*Last updated: 2026-03-01 by Platform Operations Team*
+WIKICONTENT
+)
+
+curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
+    -H "Content-Type: application/json" \
+    -d "{\"title\":\"Service-Catalog\",\"content_base64\":\"$(echo "$WIKI11_NOISE5" | base64 -w0)\"}" \
+    2>/dev/null && echo "  Wiki: Service-Catalog" || true
+
+# ── WIKI PAGE 12: SRE Scaling Standards (KEY — correct thresholds but buried in narrative) ──
+WIKI12=$(cat <<'WIKICONTENT'
 ## SRE Scaling Standards — Production HPA Policy
 
 ### Purpose
 This document defines the scaling parameters for production HPA-managed services on the Bleater platform. These standards were updated after the Q4 2025 scaling incident (INC-2025-0391) where aggressive autoscaling caused cascading pod evictions.
-
-> **Note**: This page supersedes the Q3 2025 baselines that are still stored in the `sre-scaling-baseline` ConfigMap. That ConfigMap has **not been updated** to reflect the post-incident changes. Always use this wiki page as the authoritative source.
 
 ### Background
 
@@ -3272,13 +3603,13 @@ For exceptions to these standards, file a request in JIRA project PLAT with busi
 ---
 *Approved by: SRE Leadership — 2026-01-15*
 *Last reviewed: 2026-03-01*
-*Supersedes: Q3 2025 baselines (sre-scaling-baseline ConfigMap)*
+*Document ID: SRE-POL-2026-004*
 WIKICONTENT
 )
 
 curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
     -H "Content-Type: application/json" \
-    -d "{\"title\":\"SRE-Scaling-Standards\",\"content_base64\":\"$(echo "$WIKI7" | base64 -w0)\"}" \
+    -d "{\"title\":\"SRE-Scaling-Standards\",\"content_base64\":\"$(echo "$WIKI12" | base64 -w0)\"}" \
     2>/dev/null && echo "  Wiki: SRE-Scaling-Standards" || true
 
 echo "✓ Wiki documentation populated"
@@ -3316,7 +3647,7 @@ if [ -n "$ISSUE1_ID" ]; then
     # Comment 1: Initial investigation — vague, mentions wiki
     curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
         -H "Content-Type: application/json" \
-        -d '{"body":"Looked into this. The HPA stabilization windows are way too low — definitely not meeting our SRE standards. The selectPolicy also looks wrong. Check the SRE-Scaling-Standards wiki page for the correct production thresholds.\n\nAlso the CPU target seems absurdly low and the deployment resources are underprovisioned. The sre-scaling-baseline ConfigMap in bleater namespace has some reference values but I think those might be outdated (Q3 2025)."}' \
+        -d '{"body":"Looked into this. The HPA stabilization windows are way too low — definitely not meeting our SRE standards. The selectPolicy also looks wrong.\n\nAlso the CPU target seems absurdly low and the deployment resources are underprovisioned. Need to check what the current approved thresholds are supposed to be."}' \
         2>/dev/null || true
     sleep 1
 
@@ -3330,7 +3661,7 @@ if [ -n "$ISSUE1_ID" ]; then
     # Comment 3: Metrics and resources — hints but no exact values
     curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
         -H "Content-Type: application/json" \
-        -d '{"body":"The metrics pipeline is also broken — HPA shows unknown for CPU metrics. Might be an APIService or service selector issue. And there is something in the bleater namespace blocking resource changes (getting admission errors when trying to set proper CPU limits).\n\nThe Platform-Operations-Framework wiki page has info about the enforcement architecture. Worth reading before trying to fix things — there are multiple layers involved."}' \
+        -d '{"body":"The metrics pipeline is also broken — HPA shows unknown for CPU metrics. Might be an APIService or service selector issue. And there is something in the bleater namespace blocking resource changes (getting admission errors when trying to set proper CPU limits).\n\nBe careful — there are multiple enforcement layers involved. Changes keep getting reverted."}' \
         2>/dev/null || true
     sleep 1
 
@@ -3340,14 +3671,14 @@ fi
 # Issue 2: Scaling standards reminder — references wiki but doesn't list values
 ISSUE2_ID=$(curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues" \
     -H "Content-Type: application/json" \
-    -d '{"title":"Reminder: audit all HPAs against SRE scaling standards","body":"All production HPAs need to be audited against our current SRE scaling standards. The standards were updated after the Q4 2025 incident (INC-2025-0391) — the latest approved values are on the SRE-Scaling-Standards wiki page.\n\nNote: the sre-scaling-baseline ConfigMap in the bleater namespace has older Q3 2025 values that may not reflect the current standards. Always reference the wiki as the source of truth.\n\nThe api-gateway HPA is suspected to be non-compliant. Please investigate and bring into compliance.","labels":[]}' \
+    -d '{"title":"Reminder: audit all HPAs against SRE scaling standards","body":"All production HPAs need to be audited against our current SRE scaling standards. The standards were updated after the Q4 2025 incident (INC-2025-0391).\n\nThe api-gateway HPA is suspected to be non-compliant. Please investigate and bring into compliance. Check the ConfigMaps in the bleater namespace for reference values.","labels":[]}' \
     2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('number',''))" 2>/dev/null)
 
 if [ -n "$ISSUE2_ID" ]; then
     # Comment pointing to contradictory sources
     curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE2_ID}/comments" \
         -H "Content-Type: application/json" \
-        -d '{"body":"Heads up — there is also an hpa-scaling-review-q4 ConfigMap with PROPOSED changes from the Q4 review. Those are NOT approved yet — do not apply them. Stick with the wiki page values.\n\nAlso be careful with the Metrics-Server-Architecture wiki page — some of the info there about the service selector is from before the v2.0 migration and may be wrong."}' \
+        -d '{"body":"Heads up — there is also an hpa-scaling-review-q4 ConfigMap with PROPOSED changes from the Q4 review. Check the status field on the ConfigMaps to see which ones are current.\n\nAlso the metrics pipeline seems off — might be related to the service selector changes."}' \
         2>/dev/null || true
     echo "  ✓ Issue #${ISSUE2_ID} created (standards reminder)"
 fi
@@ -3458,35 +3789,78 @@ post_msg() {
     sleep 1
 }
 
-# Message 1: Enforcement architecture hint (useful but vague)
-post_msg "@team Compliance enforcement is active on the bleater platform. Multiple layers involved — CronJobs, node-level components, and auto-deploy manifests. Changes made via kubectl may get reverted. Check the Platform-Operations-Framework wiki for architecture details."
+# ── NOISE BLOCK 1 ──
+post_msg "hey team, anyone know if the office wifi password changed? can't connect on the 3rd floor"
+post_msg "Reminder: team retrospective is tomorrow at 2pm. Please fill out the retro board before the meeting."
+post_msg "Just pushed a fix for the login button alignment on mobile. Can someone review PR #247?"
+post_msg "Does anyone have the Jira credentials for the PLAT project? I need to file a ticket for the load balancer cert renewal."
+post_msg "the new coffee machine on floor 2 is amazing. highly recommend the oat milk latte setting"
+post_msg "PSA: parking lot B will be closed next week for resurfacing. Use lot C or the street parking on Elm."
+post_msg "Is the CI pipeline broken again? My last 3 builds timed out."
 
-# Message 2: WRONG advice — points to outdated ConfigMap (TRAP)
-post_msg "For anyone configuring HPAs: reference the \`sre-scaling-baseline\` ConfigMap in the bleater namespace. It has the approved production thresholds for stabilization windows, selectPolicy, CPU targets, etc. Should be the source of truth for all scaling configs."
+# ── BURIED HINT 1: stabilization thresholds (casual, numbers as words) ──
+post_msg "ugh, the api-gateway pods keep flapping. I think the scaleDown cooldown is way too short — after the Q4 postmortem we agreed it should be at least three minutes but I don't think anyone updated it. the scaleUp side needs work too, probably around forty-five seconds minimum to stop the rapid burst reactions"
 
-# Message 3: Partially corrects message 2 (but introduces ambiguity)
-post_msg "Actually, I think the sre-scaling-baseline ConfigMap might be outdated (Q3 values). The SRE team updated the standards after the Q4 incident. Check the **SRE-Scaling-Standards** wiki page for the latest — some of the thresholds changed."
+# ── NOISE BLOCK 2 ──
+post_msg "Anyone going to the DevOps meetup next Thursday? They're doing a talk on GitOps workflows."
+post_msg "FYI I'll be OOO next Monday and Tuesday. Sarah is covering my on-call shift."
+post_msg "Has anyone tried the new Grafana 10 dashboards? The alerting UI is way better than v9."
+post_msg "@channel don't forget to submit your expense reports by end of month. Finance is sending reminders."
+post_msg "The air conditioning in the server room is acting up again. Facilities ticket #4821 filed."
+post_msg "Anyone know a good Terraform module for AWS WAF rules? The one we're using is deprecated."
+post_msg "New employee onboarding: please welcome Alex to the platform team! Alex will be working on the notification service."
+post_msg "Lunch plans? Thinking about that new Thai place on 5th street."
 
-# Message 4: CONTRADICTORY selectPolicy advice
-post_msg "Question: the Q4 scaling review (hpa-scaling-review-q4 ConfigMap) recommends selectPolicy: Max for scaleUp. But the sre-scaling-baseline says Disabled. Which one should we use? I thought the wiki says something different again."
+# ── BURIED HINT 2: CPU target and resources (casual, mixed in conversation) ──
+post_msg "random question — what CPU target are we supposed to use for API services? The gateway is set to like 5% which seems insane. I remember from the incident review it should be somewhere around fifty percent, definitely not below forty. And the CPU request is way too low, needs to be at least fifty millicore or the utilization math is garbage"
 
-# Message 5: Vague response (doesn't resolve confusion)
-post_msg "Use whatever the SRE wiki says. The ConfigMaps have different versions and some are outdated or proposals. The wiki is maintained by SRE leadership and should be authoritative. But double-check because I've seen conflicting info between the wiki pages too."
+# ── NOISE BLOCK 3 ──
+post_msg "@sarah.chen can you approve my PTO request? It's been pending for 3 days."
+post_msg "PSA: please stop committing directly to main. Use feature branches and PRs. This is the third time this week someone pushed a broken build."
+post_msg "The staging database backup job failed last night. Anyone from the DB team available to look?"
+post_msg "Does anyone have the zoom link for the all-hands tomorrow?"
+post_msg "just discovered you can get free O'Reilly books through the company Safari subscription. link is on the intranet somewhere"
+post_msg "Can someone help me debug a flaky integration test? test_user_registration_flow keeps failing intermittently."
+post_msg "Reminder: mandatory security training due by March 31st. Link in your email."
+post_msg "Team standup notes: \n- Mobile team is blocked on the push notification API\n- Backend team is investigating the database connection pool sizing\n- Platform team is dealing with some autoscaling issues"
 
-# Message 6: Static pod / server manifest hint (useful)
-post_msg "Reminder: static pods are managed by kubelet directly — \`kubectl delete\` won't work. You have to remove the manifest file from disk. Same goes for k3s auto-deploy manifests in the server directory."
+# ── BURIED HINT 3: enforcement mechanisms (vague, casual) ──
+post_msg "whoever is looking at the HPA issue — be careful, there are things running in the background that revert your changes. I saw some jobs across different namespaces that look like maintenance tasks but they're actually patching the HPA config back. also something on the node itself keeps recreating stuff even after you delete the jobs"
 
-# Message 7: Migration red herring
-post_msg "FYI the scaling migration (v2 HPA - \`bleater-gateway-scaling-v2\`) is ON HOLD pending review from Sarah. The DaemonSet in kube-system maintains it during migration. See the Scaling-Migration-Status wiki page for details before making any changes."
+# ── NOISE BLOCK 4 ──
+post_msg "Does anyone know where the VPN config file is? I need to connect to the staging environment from home."
+post_msg "Happy birthday Marcus! Cake in the break room at 3pm."
+post_msg "The load balancer SSL cert expires in 12 days. Who owns the renewal process?"
+post_msg "anyone else getting 502s on the staging environment? started about 30 min ago"
+post_msg "FYI the sprint planning meeting has been moved to Wednesday 10am due to the holiday on Monday."
+post_msg "Can someone review the Terraform plan for the new Redis cluster? PR #312 in the infra repo."
+post_msg "I just noticed the monitoring dashboard shows disk usage at 87% on the logging node. Should we add more storage?"
 
-# Message 8: Metrics hint (partially wrong)
-post_msg "Seeing metric gaps in the dashboards. Someone should check if the metrics-server service selector and APIService config are correct. The Metrics-Server-Architecture wiki page has the expected config but some of that info might be from before the aggregation migration."
+# ── BURIED HINT 4: selectPolicy and CPU limit (very casual) ──
+post_msg "btw for the HPA stuff — make sure the select policy is set so it picks the least aggressive option, not the most aggressive. after what happened in Q4 we can't have it choosing the maximum scaling action anymore. the limit on resources should be at least two hundred millicore for the gateway"
 
-# Message 9: LimitRange hint (useful)
-post_msg "There's a LimitRange in the bleater namespace that seems too restrictive. Not sure what the exact limit is but it might be blocking deployment resource changes. Worth checking."
+# ── NOISE BLOCK 5 ──
+post_msg "Anyone else having issues with Slack notifications? I keep getting duplicates."
+post_msg "Just deployed the new rate limiter to staging. Load test results look good — p99 latency dropped 40%."
+post_msg "Is the printer on floor 4 working again? I need to print some architecture diagrams for the whiteboard session."
+post_msg "Quick poll: should we switch from PagerDuty to Opsgenie? DM me your thoughts."
+post_msg "the intern broke prod again lol. just kidding, it was me. fixing now."
+post_msg "Has anyone set up Datadog APM tracing for Go services? Looking for examples."
+post_msg "Reminder: the quarterly architecture review is next Friday. Prepare your service dependency diagrams."
+post_msg "anyone want to do a coffee run? heading to Blue Bottle in 10"
 
-# Message 10: General vague warning
-post_msg "To whoever is fixing the api-gateway HPA — be aware there are multiple enforcement mechanisms that will revert your changes. CronJobs across several namespaces, a DaemonSet, and filesystem-level enforcers. You need to neutralize ALL of them before your fixes will stick."
+# ── BURIED HINT 5: replica bounds and duplicate HPA (very casual) ──
+post_msg "one more thing about the gateway scaling — we should only have ONE autoscaler per deployment, having two of them fighting each other is part of the problem. and the replica range should allow at least two minimum for HA, with a cap that doesn't go crazy — something between eight and fifteen max"
+
+# ── NOISE BLOCK 6 ──
+post_msg "Friday afternoon team social is at the usual place. First round is on the infrastructure budget"
+post_msg "Can someone restart the Jenkins build agent? Job #1847 has been stuck for 2 hours."
+post_msg "does anyone remember the admin password for the old Confluence instance? Need to export some docs."
+post_msg "The DNS propagation for the new subdomain is taking forever. It's been 6 hours."
+post_msg "New Kubernetes security advisory: CVE-2026-1234. We should patch the cluster this week."
+post_msg "Who's responsible for the Bleater mobile app push notification service? Getting reports of delayed notifications."
+post_msg "Good news: the new CDN rollout reduced image load times by 60% globally. Nice work @frontend-team!"
+post_msg "Can we get more whiteboard markers? Every single one on floor 3 is dried out."
 
 echo "  ✓ Mattermost messages posted"
 ) # end Mattermost subshell
