@@ -67,7 +67,7 @@ echo "Step 3: Creating platform policy ConfigMaps..."
 
 kubectl apply -f - <<EOF
 # ── CM 1: hpa-scaling-config — FIRST STOP (task.yaml sends agents here) ──────
-# All wrong: 150s/30s windows, 35% target, 40m request, 150m limit, Disabled policy, 1 min replica
+# Abstract parameter names, wrong values, softened tone — not "production approved"
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -77,27 +77,26 @@ metadata:
     app.kubernetes.io/managed-by: platform-ops
     app.kubernetes.io/component: autoscaling-policy
   annotations:
-    platform-ops.io/description: "HPA scaling configuration — production approved thresholds"
+    platform-ops.io/description: "Reference baselines for HPA scaling — values under periodic review"
     platform-ops.io/last-updated: "2026-02-28T14:30:00Z"
-    platform-ops.io/approved-by: "Platform Operations Team"
 data:
-  scaleDown.stabilization_Window_Seconds: "150"
-  scaleUp.stabilization_Window_Seconds: "30"
-  scaleDown.select_Policy: "Disabled"
-  scaleUp.select_Policy: "Disabled"
-  cpu.average_Utilization: "35"
-  resources.requests_cpu: "40m"
-  resources.limits_cpu: "150m"
-  min_Replicas: "1"
-  max_Replicas: "20"
-  scaleDown.policies.percent_Value: "50"
-  scaleDown.policies.period_Seconds: "30"
-  scaleUp.policies.percent_Value: "150"
-  scaleUp.policies.period_Seconds: "30"
-  notes: "Production scaling thresholds for bleater API services. Service-specific tuning overrides are maintained separately in hpa-tuning-params."
+  scale_in_cooldown_baseline: "150"
+  scale_out_cooldown_baseline: "30"
+  scale_in_action_preference: "Disabled"
+  scale_out_action_preference: "Disabled"
+  compute_threshold_pct: "35"
+  min_compute_allocation: "40m"
+  max_compute_allocation: "150m"
+  floor_instance_count: "1"
+  ceiling_instance_count: "20"
+  scale_in_rate_pct: "50"
+  scale_in_rate_window: "30"
+  scale_out_rate_pct: "150"
+  scale_out_rate_window: "30"
+  notes: "Reference baselines from initial deployment. These are starting points — current production standards may have been updated. Service-specific tuning overrides are maintained separately in hpa-tuning-params."
 ---
 # ── CM 2: hpa-tuning-params — SECOND STOP ────────────────────────────────────
-# Different naming convention, different wrong values. Vaguely references sre-scaling-baseline.
+# Different abstract naming, different wrong values. Vaguely references sre-scaling-baseline.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -110,21 +109,20 @@ metadata:
     platform-ops.io/description: "Service-level tuning parameters — api-gateway specific overrides"
     platform-ops.io/last-updated: "2026-02-20T09:15:00Z"
 data:
-  behavior.scaleDown.stabilization_window_seconds: "120"
-  behavior.scaleUp.stabilization_window_seconds: "20"
-  behavior.select_policy: "Max"
-  metrics.resource.cpu.target_average_utilization: "30"
-  container.resources.request_cpu: "30m"
-  container.resources.limit_cpu: "100m"
-  spec.min_replicas: "1"
-  spec.max_replicas: "25"
-  metrics.resource.memory.enabled: "true"
-  metrics.resource.memory.target_average_utilization: "3"
-  notes: "Api-gateway tuning overrides. Baselines and approval history are tracked in the sre-scaling-baseline resource."
+  contraction_settling_period: "120"
+  expansion_settling_period: "20"
+  scaling_action_mode: "Max"
+  cpu_utilization_threshold: "30"
+  cpu_floor_millicores: "30"
+  cpu_ceiling_millicores: "100"
+  instance_lower_bound: "1"
+  instance_upper_bound: "25"
+  memory_scaling_enabled: "true"
+  memory_utilization_threshold: "3"
+  notes: "Api-gateway tuning overrides — experimental values, may not reflect current standards. Baselines and approval history are tracked in the sre-scaling-baseline resource."
 ---
-# ── CM 3: sre-scaling-baseline — THIRD STOP (most authoritative-looking) ─────
-# Looks like THE official source. Dated recently, status ACTIVE, SRE approved.
-# ALL values wrong but plausible. Vaguely references platform-ops-changelog.
+# ── CM 3: sre-scaling-baseline — THIRD STOP ──────────────────────────────────
+# Softened tone, abstract names, wrong values. Vaguely references platform-ops-changelog.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -134,23 +132,22 @@ metadata:
     app.kubernetes.io/managed-by: sre-team
     app.kubernetes.io/component: scaling-standards
   annotations:
-    sre.bleater.io/description: "Production scaling baseline — current approved values"
-    sre.bleater.io/approved-by: "SRE Leadership"
-    sre.bleater.io/approved-date: "2026-02-28"
-    sre.bleater.io/status: "ACTIVE"
+    sre.bleater.io/description: "SRE scaling baseline reference — pre-incident values"
+    sre.bleater.io/origin: "Q3 2025 capacity planning review"
+    sre.bleater.io/status: "BASELINE"
 data:
-  scaleDown.stabilizationWindow_Seconds: "150"
-  scaleUp.stabilizationWindow_Seconds: "35"
-  behavior.selectPolicy: "Disabled"
-  cpu.averageUtilization_min: "30"
-  cpu.averageUtilization_max: "75"
-  resources.requests_cpu_min: "40m"
-  resources.limits_cpu_min: "150m"
-  minReplicas_range: "1-3"
-  maxReplicas_range: "10-20"
-  scaleDown.percent_max_per_60s: "40"
-  scaleUp.percent_max_per_60s: "120"
-  notes: "Approved production baselines. For change history refer to the platform-ops-changelog."
+  downscale_hold_seconds: "150"
+  upscale_hold_seconds: "35"
+  action_selection_mode: "Disabled"
+  utilization_floor_pct: "30"
+  utilization_ceiling_pct: "75"
+  request_floor_millicores: "40"
+  limit_floor_millicores: "150"
+  replica_range_min: "1-3"
+  replica_range_max: "10-20"
+  downscale_max_pct_per_cycle: "40"
+  upscale_max_pct_per_cycle: "120"
+  notes: "Baseline values from Q3 2025 capacity review. These may not reflect post-incident adjustments. For change history refer to the platform-ops-changelog."
 ---
 # ── CM 4: platform-ops-changelog — FOURTH STOP (dry changelog, no pointers) ──
 # Just dates and events. Does NOT mention wiki, Mattermost, or any external source.
@@ -3647,7 +3644,7 @@ if [ -n "$ISSUE1_ID" ]; then
     # Comment 1: Initial investigation — vague, mentions wiki
     curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
         -H "Content-Type: application/json" \
-        -d '{"body":"Looked into this. The HPA stabilization windows are way too low — definitely not meeting our SRE standards. The selectPolicy also looks wrong.\n\nAlso the CPU target seems absurdly low and the deployment resources are underprovisioned. Need to check what the current approved thresholds are supposed to be."}' \
+        -d '{"body":"Looked into this. The HPA stabilization windows are way too low — definitely not meeting our SRE standards. The selectPolicy also looks wrong.\n\nAlso the CPU target seems absurdly low and the deployment resources are underprovisioned. Need to check what the current approved thresholds are supposed to be. I think someone documented the post-incident standards somewhere in the wiki but I can't find the page."}' \
         2>/dev/null || true
     sleep 1
 

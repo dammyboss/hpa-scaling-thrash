@@ -159,11 +159,11 @@ def grade(transcript: str) -> GradingResult:
     Two HPA reads 70s apart — values must be correct on BOTH reads.
 
     Subscores:
-    1. hpa_behavior_compliant    — HPA behavior config meets SRE standards (6 sub-checks averaged)
-    2. metrics_pipeline_healthy  — metrics-server, APIService, HPA computing (3 sub-checks averaged)
-    3. workload_config_valid     — CPU target, resources, LimitRange, replicas, no dups (5 sub-checks averaged)
-    4. enforcement_removed       — CronJobs deleted, static pod + k3s manifest removed (3 sub-checks averaged)
-    5. fix_durable               — ALL HPA params correct on BOTH reads 70s apart (all-or-nothing)
+    1. hpa_scaling_stable    — HPA behavior config meets SRE standards (6 sub-checks averaged)
+    2. resource_metrics_available  — metrics-server, APIService, HPA computing (3 sub-checks averaged)
+    3. workload_supports_autoscaling     — CPU target, resources, LimitRange, replicas, no dups (5 sub-checks averaged)
+    4. no_config_reversion       — CronJobs deleted, static pod + k3s manifest removed (3 sub-checks averaged)
+    5. config_stable_over_time               — ALL HPA params correct on BOTH reads 70s apart (all-or-nothing)
     """
     namespace = "bleater"
     hpa_name = "bleater-api-gateway-hpa"
@@ -214,7 +214,7 @@ def grade(transcript: str) -> GradingResult:
     spec2 = hpa2.get("spec", {})
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 1: hpa_behavior_compliant (0.20)
+    # SUBSCORE 1: hpa_scaling_stable (0.20)
     # 6 sub-checks averaged — each sub-check must pass on BOTH reads:
     #   1a. scaleDown stabilizationWindowSeconds >= 180
     #   1b. scaleDown selectPolicy != Max
@@ -315,17 +315,17 @@ def grade(transcript: str) -> GradingResult:
             print(f"  ✗ 1f: ScaleUp policies too aggressive")
 
         passed = sum(1 for c in behavior_checks if c)
-        subscores["hpa_behavior_compliant"] = passed / len(behavior_checks)
-        print(f"  => hpa_behavior_compliant: {passed}/{len(behavior_checks)} = {subscores['hpa_behavior_compliant']:.3f}")
+        subscores["hpa_scaling_stable"] = passed / len(behavior_checks)
+        print(f"  => hpa_scaling_stable: {passed}/{len(behavior_checks)} = {subscores['hpa_scaling_stable']:.3f}")
 
     except Exception as e:
         print(f"Error checking HPA behavior: {e}")
-        subscores["hpa_behavior_compliant"] = 0.0
+        subscores["hpa_scaling_stable"] = 0.0
 
-    weights["hpa_behavior_compliant"] = W
+    weights["hpa_scaling_stable"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 2: metrics_pipeline_healthy (0.20)
+    # SUBSCORE 2: resource_metrics_available (0.20)
     # 3 sub-checks averaged:
     #   2a. metrics-server deployment healthy (ready replicas > 0)
     #   2b. APIService v1beta1.metrics.k8s.io points to kube-system/metrics-server
@@ -413,17 +413,17 @@ def grade(transcript: str) -> GradingResult:
                 print(f"  ✗ 2c: HPA currentMetrics does not show CPU utilization")
 
         passed = sum(1 for c in pipeline_checks if c)
-        subscores["metrics_pipeline_healthy"] = passed / len(pipeline_checks)
-        print(f"  => metrics_pipeline_healthy: {passed}/{len(pipeline_checks)} = {subscores['metrics_pipeline_healthy']:.3f}")
+        subscores["resource_metrics_available"] = passed / len(pipeline_checks)
+        print(f"  => resource_metrics_available: {passed}/{len(pipeline_checks)} = {subscores['resource_metrics_available']:.3f}")
 
     except Exception as e:
         print(f"Error checking metrics pipeline: {e}")
-        subscores["metrics_pipeline_healthy"] = 0.0
+        subscores["resource_metrics_available"] = 0.0
 
-    weights["metrics_pipeline_healthy"] = W
+    weights["resource_metrics_available"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 3: workload_config_valid (0.20)
+    # SUBSCORE 3: workload_supports_autoscaling (0.20)
     # 5 sub-checks averaged (checked on BOTH reads where applicable):
     #   3a. CPU target 40-80%, no memory metric
     #   3b. CPU request >= 50m
@@ -552,17 +552,17 @@ def grade(transcript: str) -> GradingResult:
                 print(f"  ✗ 3e: {len(gateway_hpas)} HPAs target bleater-api-gateway (need exactly 1)")
 
         passed = sum(1 for c in workload_checks if c)
-        subscores["workload_config_valid"] = passed / len(workload_checks)
-        print(f"  => workload_config_valid: {passed}/{len(workload_checks)} = {subscores['workload_config_valid']:.3f}")
+        subscores["workload_supports_autoscaling"] = passed / len(workload_checks)
+        print(f"  => workload_supports_autoscaling: {passed}/{len(workload_checks)} = {subscores['workload_supports_autoscaling']:.3f}")
 
     except Exception as e:
         print(f"Error checking workload config: {e}")
-        subscores["workload_config_valid"] = 0.0
+        subscores["workload_supports_autoscaling"] = 0.0
 
-    weights["workload_config_valid"] = W
+    weights["workload_supports_autoscaling"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 4: enforcement_removed (0.20)
+    # SUBSCORE 4: no_config_reversion (0.20)
     # 3 sub-checks averaged:
     #   4a. ALL enforcer CronJobs deleted (not just suspended) across all namespaces
     #   4b. Static pod enforcer manifest removed from disk
@@ -669,17 +669,17 @@ def grade(transcript: str) -> GradingResult:
             print(f"  ✗ 4c: K3s auto-deploy enforcer manifest still on disk")
 
         passed = sum(1 for c in enforcement_checks if c)
-        subscores["enforcement_removed"] = passed / len(enforcement_checks)
-        print(f"  => enforcement_removed: {passed}/{len(enforcement_checks)} = {subscores['enforcement_removed']:.3f}")
+        subscores["no_config_reversion"] = passed / len(enforcement_checks)
+        print(f"  => no_config_reversion: {passed}/{len(enforcement_checks)} = {subscores['no_config_reversion']:.3f}")
 
     except Exception as e:
         print(f"Error checking enforcement removal: {e}")
-        subscores["enforcement_removed"] = 0.0
+        subscores["no_config_reversion"] = 0.0
 
-    weights["enforcement_removed"] = W
+    weights["no_config_reversion"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
-    # SUBSCORE 5: fix_durable (0.20)
+    # SUBSCORE 5: config_stable_over_time (0.20)
     # ALL-OR-NOTHING: Every HPA param must be correct on BOTH reads.
     # This tests that enforcement is truly neutralized — if any CronJob,
     # static pod, or k3s manifest survived, the HPA will be reverted
@@ -730,18 +730,18 @@ def grade(transcript: str) -> GradingResult:
             print(f"  ✗ 5: ScaleUp policies drifted between reads")
 
         if durable:
-            subscores["fix_durable"] = 1.0
+            subscores["config_stable_over_time"] = 1.0
             print(f"  ✓ 5: All HPA parameters stable across both reads")
         else:
-            subscores["fix_durable"] = 0.0
+            subscores["config_stable_over_time"] = 0.0
 
-        print(f"  => fix_durable: {subscores['fix_durable']:.3f}")
+        print(f"  => config_stable_over_time: {subscores['config_stable_over_time']:.3f}")
 
     except Exception as e:
         print(f"Error checking durability: {e}")
-        subscores["fix_durable"] = 0.0
+        subscores["config_stable_over_time"] = 0.0
 
-    weights["fix_durable"] = W
+    weights["config_stable_over_time"] = W
 
     # ═════════════════════════════════════════════════════════════════════════
     # Final score calculation
@@ -755,31 +755,22 @@ def grade(transcript: str) -> GradingResult:
     feedback_lines = []
 
     checks = [
-        ("hpa_behavior_compliant",
-         f"HPA behavior config meets SRE standards ({subscores.get('hpa_behavior_compliant', 0):.0%} of checks passed)",
-         f"HPA behavior config non-compliant ({subscores.get('hpa_behavior_compliant', 0):.0%} of checks passed) — windows, selectPolicy, or policies incorrect"),
-        ("metrics_pipeline_healthy",
-         f"Metrics pipeline healthy ({subscores.get('metrics_pipeline_healthy', 0):.0%} of checks passed)",
-         f"Metrics pipeline issues ({subscores.get('metrics_pipeline_healthy', 0):.0%} of checks passed) — metrics-server, APIService, or HPA computation broken"),
-        ("workload_config_valid",
-         f"Workload config valid ({subscores.get('workload_config_valid', 0):.0%} of checks passed)",
-         f"Workload config issues ({subscores.get('workload_config_valid', 0):.0%} of checks passed) — CPU target/resources, LimitRange, or replica range incorrect"),
-        ("enforcement_removed",
-         f"Enforcement mechanisms removed ({subscores.get('enforcement_removed', 0):.0%} of checks passed)",
-         f"Enforcement still active ({subscores.get('enforcement_removed', 0):.0%} of checks passed) — CronJobs, static pod, or k3s manifest still present"),
-        ("fix_durable",
-         "Fix is durable — all HPA params stable across dual-read verification window",
-         "Fix is NOT durable — HPA config drifted between reads (enforcement still active)"),
+        "hpa_scaling_stable",
+        "resource_metrics_available",
+        "workload_supports_autoscaling",
+        "no_config_reversion",
+        "config_stable_over_time",
     ]
 
-    for key, pass_msg, fail_msg in checks:
+    for key in checks:
         score = subscores.get(key, 0)
+        pct = f"{score:.0%}"
         if score >= 1.0:
-            feedback_lines.append(f"✅ {pass_msg}")
+            feedback_lines.append(f"✅ {key} ({pct})")
         elif score > 0:
-            feedback_lines.append(f"⚠️ {fail_msg}")
+            feedback_lines.append(f"⚠️ {key} ({pct})")
         else:
-            feedback_lines.append(f"❌ {fail_msg}")
+            feedback_lines.append(f"❌ {key} ({pct})")
 
     feedback = "\n".join(feedback_lines)
 
