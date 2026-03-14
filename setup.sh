@@ -102,6 +102,36 @@ data:
   memory_target: "3"
 EOF
 
+# SRE baseline ConfigMap — contains correct production thresholds
+# This is discoverable evidence that supports the wiki/mattermost/issue hints
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-scaling-baseline
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: sre-team
+    app.kubernetes.io/component: scaling-standards
+  annotations:
+    sre.bleater.io/description: "Production scaling baseline — approved values per SRE-Scaling-Standards wiki"
+    sre.bleater.io/approved-by: "SRE Leadership"
+    sre.bleater.io/approved-date: "2026-01-15"
+data:
+  scaledown_stabilization_min: "180"
+  scaleup_stabilization_min: "45"
+  select_policy: "Min"
+  cpu_target_min: "40"
+  cpu_target_max: "80"
+  cpu_request_min: "50m"
+  cpu_limit_min: "200m"
+  min_replicas_range: "2-5"
+  max_replicas_range: "8-15"
+  scaledown_max_percent_per_60s: "30"
+  scaleup_max_percent_per_30s: "100"
+  notes: "These are the approved production baselines. See SRE-Scaling-Standards wiki page for full policy details."
+EOF
+
 echo "✓ ConfigMaps created"
 echo ""
 
@@ -3105,8 +3135,142 @@ curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
     -d "{\"title\":\"Metrics-Server-Architecture\",\"content_base64\":\"$(echo "$WIKI6" | base64 -w0)\"}" \
     2>/dev/null && echo "  Wiki: Metrics-Server-Architecture" || true
 
+# ── WIKI PAGE 7: SRE Scaling Standards (KEY — correct thresholds) ──────────
+WIKI7=$(cat <<'WIKICONTENT'
+## SRE Scaling Standards — Production HPA Policy
+
+### Purpose
+This document defines the **mandatory scaling parameters** for all production HPA-managed services on the Bleater platform. These standards were established after the Q4 2025 scaling incident (INC-2025-0391) where aggressive autoscaling caused cascading pod evictions.
+
+### Stabilization Windows
+
+| Direction | Minimum Window | Rationale |
+|-----------|---------------|-----------|
+| ScaleDown | **180 seconds** | Prevents premature scale-in during transient load dips. Must allow at least 3 metrics collection cycles before removing capacity. |
+| ScaleUp | **45 seconds** | Dampens burst reactions while still responding to sustained load increases within SLA. |
+
+### Select Policy
+All production HPAs **MUST** use `selectPolicy: Min` for both scaleUp and scaleDown. This ensures the HPA controller selects the **least disruptive** scaling action when multiple policies are defined.
+
+> ⚠️ **NEVER use `selectPolicy: Max`** in production — it selects the most aggressive scaling action and causes thrashing under variable load patterns.
+
+### Scaling Policies
+
+#### ScaleDown
+- No single policy should remove more than **30% of pods** in under **60 seconds**
+- Maximum per-cycle removal should not exceed 50% regardless of period
+- Recommended baseline: `Percent 10%/60s` + `Pods 2/60s` with `selectPolicy: Min`
+
+#### ScaleUp
+- No single policy should add more than **100% of pods** in under **30 seconds**
+- Recommended baseline: `Percent 50%/60s` + `Pods 3/60s` with `selectPolicy: Min`
+
+### CPU Target Utilization
+- Production API services: **40% – 80%** target utilization
+- Targets below 40% waste resources; targets above 80% risk SLA breaches under burst load
+- **CPU-only metrics** for API gateways — do not add memory-based scaling for request-processing services
+
+### Deployment Resource Requirements
+- Minimum CPU **request**: **50m** (prevents inflated utilization calculations)
+- Minimum CPU **limit**: **200m** (ensures adequate burst capacity)
+- Requests below 50m cause the HPA to compute artificially high utilization percentages
+
+### Replica Bounds
+- **minReplicas**: 2–5 (must be >= 2 for high availability)
+- **maxReplicas**: 8–15 (hard cap to prevent runaway scaling and resource exhaustion)
+- Only ONE HPA per deployment target — duplicate HPAs cause conflicting scaling decisions
+
+### Compliance
+These standards are enforced by the Platform Operations team. Non-compliant HPAs will be flagged in the weekly scaling audit report.
+
+For exceptions, file a request in JIRA project PLAT with business justification.
+
+---
+*Approved by: SRE Leadership — 2026-01-15*
+*Last reviewed: 2026-03-01*
+WIKICONTENT
+)
+
+curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/wiki/new" \
+    -H "Content-Type: application/json" \
+    -d "{\"title\":\"SRE-Scaling-Standards\",\"content_base64\":\"$(echo "$WIKI7" | base64 -w0)\"}" \
+    2>/dev/null && echo "  Wiki: SRE-Scaling-Standards" || true
+
 echo "✓ Wiki documentation populated"
 ) # end wiki subshell
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 19b: Gitea issues — incident context and threshold hints
+# ─────────────────────────────────────────────────────────────────────────────
+echo "Step 19b: Creating platform issues..."
+
+(
+set +e
+
+GITEA_PASS=$(python3 -c "
+import urllib.request, re
+try:
+    html = urllib.request.urlopen('http://passwords.devops.local', timeout=10).read().decode()
+    m = re.search(r'<h3>Gitea</h3>.*?Password.*?class=\"value\">([^<]+)', html, re.DOTALL)
+    print(m.group(1).strip() if m else 'password')
+except: print('password')
+" 2>/dev/null)
+GITEA_PASS_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${GITEA_PASS}', safe=''))")
+GITEA_SVC_IP=$(kubectl get svc gitea -n gitea -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+GITEA_HOST="${GITEA_SVC_IP}:3000"
+GITEA_API="http://root:${GITEA_PASS_ENC}@${GITEA_HOST}/api/v1"
+
+# Issue 1: HPA thrashing incident
+ISSUE1_ID=$(curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues" \
+    -H "Content-Type: application/json" \
+    -d '{"title":"P2: bleater-api-gateway HPA scaling thrash since Monday","body":"The api-gateway HPA has been thrashing since the platform-ops enforcement rollout on Monday. Pods are scaling up and down every few minutes. Customers are reporting intermittent 503 errors during scale-down events.\n\nThis needs investigation — the HPA config looks wrong but changes keep getting reverted.\n\nCC @sarah.chen @platform-ops","labels":[]}' \
+    2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('number',''))" 2>/dev/null)
+
+if [ -n "$ISSUE1_ID" ]; then
+    # Comment 1: Initial investigation
+    curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
+        -H "Content-Type: application/json" \
+        -d '{"body":"Looked into this. The HPA has a 10s stabilization window for scaleDown — that is way too aggressive. Our SRE standards require at least 180s for scaleDown and 45s for scaleUp. Also the selectPolicy is set to Max which picks the most aggressive action. Should be Min per the SRE-Scaling-Standards wiki page."}' \
+        2>/dev/null || true
+    sleep 1
+
+    # Comment 2: Deeper investigation
+    curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
+        -H "Content-Type: application/json" \
+        -d '{"body":"Found more issues: the CPU target is set to 5% which is absurdly low — per standards it should be 40-80% for API services. Also the deployment CPU request is only 1m which makes the utilization calculation meaningless. Need at least 50m request and 200m limit per the scaling standards.\n\nAlso noticed there are TWO HPAs targeting the same deployment (bleater-api-gateway-hpa and bleater-gateway-scaling-v2). That will cause conflicting scaling decisions. We should only have one."}' \
+        2>/dev/null || true
+    sleep 1
+
+    # Comment 3: Enforcement discovery
+    curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
+        -H "Content-Type: application/json" \
+        -d '{"body":"I fixed the HPA config but it got reverted within 2 minutes. There are CronJobs in kube-ops, bleater-env, and default namespaces that are re-applying the broken config from encoded ConfigMap data. Some of them look like legitimate maintenance jobs (log rotation, health checks) but they have hidden Phase 3 enforcement logic that patches the HPA.\n\nAlso found a DaemonSet in kube-system (k3s-resource-reconciler) that recreates the duplicate v2 HPA if you delete it."}' \
+        2>/dev/null || true
+    sleep 1
+
+    # Comment 4: Static pod and server manifest
+    curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
+        -H "Content-Type: application/json" \
+        -d '{"body":"Even after deleting the CronJobs and DaemonSet, enforcement came back. Found a static pod manifest and a k3s auto-deploy server manifest that recreate the enforcement resources. These are on disk — need to delete the actual files, not just the k8s resources. Check the Platform-Operations-Framework wiki page for details on how these work.\n\nAlso the metrics-server service selector is wrong (points to metrics-aggregator instead of metrics-server) and the APIService is misconfigured. Plus there is a LimitRange in bleater namespace blocking resource fixes."}' \
+        2>/dev/null || true
+    sleep 1
+
+    echo "  ✓ Issue #${ISSUE1_ID} created with comments"
+fi
+
+# Issue 2: Scaling standards reminder (cross-reference)
+ISSUE2_ID=$(curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues" \
+    -H "Content-Type: application/json" \
+    -d '{"title":"Reminder: update all HPAs to comply with SRE scaling standards","body":"Per the SRE-Scaling-Standards wiki page, all production HPAs need to meet the following minimums:\n\n- scaleDown stabilization: >= 180s\n- scaleUp stabilization: >= 45s\n- selectPolicy: Min (never Max)\n- CPU target: 40-80%\n- minReplicas: >= 2, maxReplicas: 8-15\n- CPU request >= 50m, limit >= 200m\n\nPlease audit all HPAs in the bleater namespace and bring them into compliance. The current api-gateway HPA is non-compliant on almost every parameter.","labels":[]}' \
+    2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('number',''))" 2>/dev/null)
+
+if [ -n "$ISSUE2_ID" ]; then
+    echo "  ✓ Issue #${ISSUE2_ID} created (standards reminder)"
+fi
+
+echo "✓ Platform issues created"
+) # end issues subshell
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3200,6 +3364,14 @@ post_msg "FYI the scaling migration (v2 HPA - \`bleater-gateway-scaling-v2\`) is
 post_msg "Seeing some alerts from the metrics-collector CronJob in kube-ops — looks like it's timing out on metrics API calls. Probably related to the metrics-server maintenance window. Can someone check if the service selector is correct?"
 
 post_msg "Should I be worried about the node-health-reporter pods in kube-system? They keep restarting. Also noticed some compliance-audit jobs running every minute — is that expected?"
+
+post_msg "Reminder to all teams: please review the **SRE-Scaling-Standards** wiki page before configuring any HPAs. After the Q4 incident we mandated scaleDown stabilization >= 180s, scaleUp >= 45s, and selectPolicy: Min. The api-gateway HPA is currently non-compliant on all of these."
+
+post_msg "The api-gateway HPA has CPU target set to 5% which is way below our 40-80% standard range. Also the deployment CPU request is only 1m — that makes the utilization metric meaningless. Per SRE standards we need at least 50m request and 200m limit for production API services."
+
+post_msg "FYI: I noticed the bleater namespace has a LimitRange that caps CPU limits at 100m. That will block any attempt to set the gateway container limit to the required 200m minimum. Whoever set that up needs to remove it before we can fix the deployment resources."
+
+post_msg "Also — only ONE HPA should target each deployment. We currently have two (the original and a v2 migration one). The replica range should be min 2-5 / max 8-15 per our production standards. Min=1 is not acceptable for HA services."
 
 echo "  ✓ Mattermost messages posted"
 ) # end Mattermost subshell

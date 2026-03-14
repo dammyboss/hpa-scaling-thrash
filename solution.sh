@@ -313,7 +313,7 @@ kubectl scale deployment bleater-api-gateway -n "$NS" --replicas=1
 echo "  Scaled to 1 replica"
 sleep 10
 
-# Patch resources (PSA enforce label already removed in Step 2c)
+# Patch resources (PSA enforce label already removed in Step 2b)
 kubectl patch deployment bleater-api-gateway -n "$NS" --type=strategic -p '{
   "spec": {
     "template": {

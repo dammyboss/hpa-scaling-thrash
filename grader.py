@@ -212,7 +212,7 @@ def grade(transcript: str) -> GradingResult:
 
         if window_ok and select_ok:
             subscores["scaledown_window_durable"] = 1.0
-            print(f"✓ ScaleDown window: {sd_window1}s/{sd_window2}s (>= 120), selectPolicy: {sd_select1}/{sd_select2}")
+            print(f"✓ ScaleDown window: {sd_window1}s/{sd_window2}s (>= 180), selectPolicy: {sd_select1}/{sd_select2}")
         else:
             subscores["scaledown_window_durable"] = 0.0
             if not window_ok:
@@ -241,7 +241,7 @@ def grade(transcript: str) -> GradingResult:
 
         if window_ok and select_ok:
             subscores["scaleup_window_durable"] = 1.0
-            print(f"✓ ScaleUp window: {su_window1}s/{su_window2}s (>= 30), selectPolicy: {su_select1}/{su_select2}")
+            print(f"✓ ScaleUp window: {su_window1}s/{su_window2}s (>= 45), selectPolicy: {su_select1}/{su_select2}")
         else:
             subscores["scaleup_window_durable"] = 0.0
             if not window_ok:
