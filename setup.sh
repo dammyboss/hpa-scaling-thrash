@@ -3644,7 +3644,7 @@ if [ -n "$ISSUE1_ID" ]; then
     # Comment 1: Initial investigation — vague, mentions wiki
     curl -sf -X POST "${GITEA_API}/repos/root/bleater-app/issues/${ISSUE1_ID}/comments" \
         -H "Content-Type: application/json" \
-        -d '{"body":"Looked into this. The HPA stabilization windows are way too low — definitely not meeting our SRE standards. The selectPolicy also looks wrong.\n\nAlso the CPU target seems absurdly low and the deployment resources are underprovisioned. Need to check what the current approved thresholds are supposed to be. I think someone documented the post-incident standards somewhere in the wiki but I can't find the page."}' \
+        -d '{"body":"Looked into this. The HPA stabilization windows are way too low — definitely not meeting our SRE standards. The selectPolicy also looks wrong.\n\nAlso the CPU target seems absurdly low and the deployment resources are underprovisioned. Need to check what the current approved thresholds are supposed to be. I think someone documented the post-incident standards somewhere in the wiki but I cannot find the page."}' \
         2>/dev/null || true
     sleep 1
 
