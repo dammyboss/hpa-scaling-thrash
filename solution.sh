@@ -66,6 +66,7 @@ spec:
   containers:
   - name: cleaner
     image: bitnami/kubectl:latest
+    imagePullPolicy: IfNotPresent
     command:
     - /bin/sh
     - -c
