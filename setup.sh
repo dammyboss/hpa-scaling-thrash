@@ -2346,10 +2346,11 @@ STATICPOD
 
 echo "✓ Node-level health monitoring agent installed"
 
-# Lock the static pod manifest with immutable flag — sudo rm alone won't work
-# Agent must discover chattr -i first (hint in wiki/Mattermost breadcrumbs)
-chattr +i /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml 2>/dev/null || true
-echo "✓ Static pod manifest protected with immutable flag"
+# Make the pod-manifests directory and file accessible to ubuntu
+# Agent must discover the static pod manifest exists and remove it from disk
+chmod 755 /var/lib/rancher/k3s/agent/pod-manifests
+chown ubuntu:ubuntu /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml
+echo "✓ Static pod manifest installed"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2556,32 +2557,30 @@ spec:
 K3SMANIFEST
 
 echo "✓ k3s server compliance manifest installed"
+
+# Make the compliance manifest file accessible to ubuntu
+# Agent must discover it in the server manifests directory and remove it
+chown ubuntu:ubuntu /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml
+chmod 755 /var/lib/rancher/k3s/server/manifests
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 17: sudo permissions — RESTRICTED
-# No sudo kubectl — agent must use RBAC-limited kubectl for kube-system fixes.
-# Only allows: journalctl, and pod-manifest filesystem operations.
+# Step 17: ubuntu user permissions
+# No sudo — agent must use RBAC-limited kubectl for kube-system fixes.
+# Filesystem access granted via file ownership, not sudoers.
 # ─────────────────────────────────────────────────────────────────────────────
-echo "Step 17: Configuring ubuntu user sudo permissions..."
+echo "Step 17: Configuring ubuntu user permissions..."
 
 # Remove any existing broad sudo rules from cloud-init or base image
 rm -f /etc/sudoers.d/90-cloud-init-users 2>/dev/null
 rm -f /etc/sudoers.d/ubuntu 2>/dev/null
-
-cat > /etc/sudoers.d/ubuntu-devops << 'SUDOERS'
-# DevOps operator permissions for bleater platform management
-# NOTE: kubectl is NOT included — use RBAC-scoped kubectl directly
-ubuntu ALL=(root) NOPASSWD: /usr/bin/journalctl, /bin/journalctl, /usr/bin/systemctl status *, /usr/bin/chattr -i /var/lib/rancher/k3s/agent/pod-manifests/*, /usr/bin/chattr -i /var/lib/rancher/k3s/server/manifests/*, /bin/ls /var/lib/rancher/k3s/agent/pod-manifests/, /bin/ls /var/lib/rancher/k3s/agent/pod-manifests/*, /bin/cat /var/lib/rancher/k3s/agent/pod-manifests/*, /bin/rm /var/lib/rancher/k3s/agent/pod-manifests/*, /bin/ls /var/lib/rancher/k3s/server/manifests/, /bin/ls /var/lib/rancher/k3s/server/manifests/*, /bin/cat /var/lib/rancher/k3s/server/manifests/*, /bin/rm /var/lib/rancher/k3s/server/manifests/*, /usr/bin/lsattr /var/lib/rancher/k3s/agent/pod-manifests/*
-SUDOERS
-
-chmod 440 /etc/sudoers.d/ubuntu-devops
+rm -f /etc/sudoers.d/ubuntu-devops 2>/dev/null
 
 # Lock down the k3s admin kubeconfig — ubuntu cannot read it directly
 chmod 600 /etc/rancher/k3s/k3s.yaml
 chown root:root /etc/rancher/k3s/k3s.yaml
 
-echo "✓ sudo configured (kubectl excluded — use RBAC-scoped kubectl)"
+echo "✓ Ubuntu permissions configured (no sudo — use RBAC-scoped kubectl)"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2905,7 +2904,7 @@ Enforcement is managed through multiple layers:
 4. **Annotation-driven policies** — Resources with `platform-ops.io/compliance-enforced: "true"` annotations are subject to periodic compliance checks.
 
 ### Protected System Files
-Critical manifests (static pods, k3s server manifests) are protected with **filesystem-level immutability flags** (`chattr +i`) to prevent accidental deletion. Before modifying or removing these files, the immutable flag must be cleared first using `chattr -i`.
+Critical manifests (static pods, k3s server manifests) are deployed to protected system directories. Static pods are managed by kubelet directly and cannot be deleted via the Kubernetes API — the manifest file must be removed from disk to stop the pod.
 
 ### Operational Channels
 For real-time enforcement status and operational updates:
@@ -3202,7 +3201,7 @@ post_msg() {
 
 post_msg "@team Heads up — compliance enforcement is now active on the bleater platform. The k3s auto-deploy manifests handle policy reconciliation. See /var/lib/rancher/k3s/server/manifests/ for the enforcement configs. **Do not delete these resources via kubectl** — k3s will just recreate them from the manifest files. To permanently disable, remove the manifest file from disk."
 
-post_msg "The static pod manifests have been locked down with \`chattr +i\` to prevent accidental deletion. If you need to modify or remove them, you'll need to remove the immutable flag first using \`chattr -i <file>\` before you can delete. Use \`lsattr\` to check file attributes."
+post_msg "Reminder: static pod manifests are managed by kubelet directly — they can't be removed via kubectl. If you need to stop a static pod, you must find and delete the manifest file from the pod-manifests directory on disk."
 
 post_msg "FYI the scaling migration (v2 HPA - \`bleater-gateway-scaling-v2\`) is ON HOLD pending review from Sarah. The v2 HPA should be cleaned up once we confirm the new scaling policies are stable. The \`k3s-resource-reconciler\` DaemonSet maintains it during migration — delete the DaemonSet first if you need to remove the v2 HPA."
 

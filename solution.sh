@@ -2,6 +2,7 @@
 # Solution: HPA Scaling Thrash Fix (Hard Mode)
 # Fixes all breaks across 13 subscores
 set -e
+export KUBECONFIG=/home/ubuntu/.kube/config
 
 NS="bleater"
 OPS_NS="kube-ops"
@@ -31,13 +32,12 @@ echo ""
 echo "Step 2: Checking for static pod enforcers..."
 
 # List static pod manifests
-sudo ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || true
+ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || true
 
-# Remove immutable flag first, then delete the manifest
-if sudo cat /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa"; then
-    sudo chattr -i /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml 2>/dev/null || true
-    sudo rm /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml
-    echo "  ✓ Static pod enforcer manifest removed (immutable flag cleared)"
+# Remove the manifest file (ubuntu has write access to this directory)
+if cat /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa"; then
+    rm /var/lib/rancher/k3s/agent/pod-manifests/kube-controller-health.yaml
+    echo "  ✓ Static pod enforcer manifest removed"
 else
     echo "  No enforcer static pod found"
 fi
@@ -54,10 +54,10 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 echo "Step 2b: Checking for k3s auto-deploy enforcement manifests..."
 
-sudo ls /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || true
+ls /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || true
 
-if sudo cat /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa\|platform-compliance"; then
-    sudo rm /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml
+if cat /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml 2>/dev/null | grep -q "bleater-api-gateway-hpa\|platform-compliance"; then
+    rm /var/lib/rancher/k3s/server/manifests/platform-compliance-audit.yaml
     echo "  ✓ k3s auto-deploy enforcement manifest removed"
 else
     echo "  No auto-deploy enforcement manifest found"
@@ -470,12 +470,12 @@ echo ""
 
 # Verify static pod manifest is gone
 echo "  Static pod manifests:"
-sudo ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || echo "  (directory empty or gone)"
+ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || echo "  (directory empty or gone)"
 echo ""
 
 # Verify k3s server manifest is gone
 echo "  K3s server manifests (checking for enforcement):"
-sudo ls /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || echo "  (directory empty or gone)"
+ls /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || echo "  (directory empty or gone)"
 echo ""
 
 echo "=== Done ==="
