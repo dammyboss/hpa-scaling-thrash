@@ -24,7 +24,8 @@ prompt: |
   workload resource definitions, and possibly other mechanisms that enforce or revert configuration changes.
 
   The platform team maintains scaling policy ConfigMaps in the bleater namespace. Start by reviewing
-  these ConfigMaps for the team's scaling standards and configuration baselines.
+  the `hpa-scaling-config` ConfigMap for the team's scaling standards and configuration baselines.
+  Additional context may exist across other platform resources.
 
   Verify the fix by ensuring:
   - The HPA is no longer thrashing and meets the team's production scaling standards
