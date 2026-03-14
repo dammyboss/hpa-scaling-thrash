@@ -15,7 +15,7 @@ RUN skopeo copy \
 # ==========================================================
 # Stage 2: Final nebula-devops image with pre-cached images
 # ==========================================================
-FROM us-central1-docker.pkg.dev/bespokelabs/nebula-devops-registry/nebula-devops:1.0.2
+FROM us-central1-docker.pkg.dev/bespokelabs/nebula-devops-registry/nebula-devops:1.0.3
 
 ENV DISPLAY_NUM=1
 ENV COMPUTER_HEIGHT_PX=768
