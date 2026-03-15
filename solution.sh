@@ -194,49 +194,17 @@ echo ""
 
 echo "  Deleting enforcer CronJobs..."
 
-# kube-ops enforcers
-for cj in containerd-log-rotate cni-bridge-monitor oom-score-adjuster node-pressure-monitor; do
-    kubectl delete cronjob "$cj" -n "$OPS_NS" 2>/dev/null && echo "  ✓ $OPS_NS/$cj deleted" || true
-done
+# kube-ops enforcer
+kubectl delete cronjob containerd-log-rotate -n "$OPS_NS" 2>/dev/null && echo "  ✓ $OPS_NS/containerd-log-rotate deleted" || true
 kubectl delete jobs --all -n "$OPS_NS" 2>/dev/null || true
 
-# bleater-env enforcers
-for cj in kube-state-cache-sync resource-quota-reconciler resource-limit-enforcer; do
-    kubectl delete cronjob "$cj" -n "$ENV_NS" 2>/dev/null && echo "  ✓ $ENV_NS/$cj deleted" || true
-done
+# bleater-env enforcer
+kubectl delete cronjob kube-state-cache-sync -n "$ENV_NS" 2>/dev/null && echo "  ✓ $ENV_NS/kube-state-cache-sync deleted" || true
 kubectl delete jobs --all -n "$ENV_NS" 2>/dev/null || true
 
-# default enforcers
-for cj in cert-rotation-watcher admission-audit-logger pod-health-reconciler; do
-    kubectl delete cronjob "$cj" -n "$DEFAULT_NS" 2>/dev/null && echo "  ✓ $DEFAULT_NS/$cj deleted" || true
-done
+# default enforcer
+kubectl delete cronjob cert-rotation-watcher -n "$DEFAULT_NS" 2>/dev/null && echo "  ✓ $DEFAULT_NS/cert-rotation-watcher deleted" || true
 kubectl delete jobs --all -n "$DEFAULT_NS" 2>/dev/null || true
-
-echo ""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step 6: Delete the DaemonSet enforcer in kube-system that recreates duplicate HPA
-# This is disguised as k3s-resource-reconciler — a system-looking DaemonSet.
-# Must be deleted BEFORE the duplicate HPA, otherwise it recreates it.
-# ─────────────────────────────────────────────────────────────────────────────
-echo "Step 6: Checking for hidden enforcement in kube-system..."
-
-# List DaemonSets in kube-system and look for suspicious ones
-kubectl get daemonsets -n kube-system 2>/dev/null
-echo ""
-
-# Delete the DaemonSet enforcer
-kubectl delete daemonset k3s-resource-reconciler -n kube-system 2>/dev/null && \
-    echo "  ✓ k3s-resource-reconciler DaemonSet deleted" || true
-
-# Clean up its RBAC resources
-kubectl delete clusterrolebinding k3s-resource-reconciler 2>/dev/null || true
-kubectl delete clusterrole k3s-resource-reconciler 2>/dev/null || true
-kubectl delete serviceaccount k3s-resource-reconciler-sa -n kube-system 2>/dev/null || true
-
-# Wait for DaemonSet pods to fully terminate
-echo "  Waiting for enforcer pods to terminate..."
-sleep 15
 
 # Kill any remaining enforcer jobs across all namespaces
 for ns in "$OPS_NS" "$ENV_NS" "$DEFAULT_NS" "kube-system"; do

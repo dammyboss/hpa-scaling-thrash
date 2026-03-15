@@ -576,8 +576,9 @@ def grade(transcript: str) -> GradingResult:
         # These CronJobs read encoded policies from ConfigMaps and patch the HPA
         enforcer_cronjobs_found = []
 
-        # Check kube-ops enforcers (containerd-log-rotate, cni-bridge-monitor,
-        # oom-score-adjuster, node-pressure-monitor are the ones that patch HPA)
+        # Check for enforcer CronJobs across all namespaces
+        # (containerd-log-rotate in kube-ops, kube-state-cache-sync in bleater-env,
+        # cert-rotation-watcher in default are the ones that patch HPA)
         for ns in ["kube-ops", "bleater-env", "default"]:
             cj_stdout, cj_rc = run_kubectl_command(
                 "get", "cronjobs", "-o", "jsonpath={.items[*].metadata.name}",
@@ -604,14 +605,6 @@ def grade(transcript: str) -> GradingResult:
         )
         if cj_rc == 0 and cj_stdout:
             enforcer_cronjobs_found.append("kube-system/platform-compliance-audit")
-
-        # Check for k3s-resource-reconciler DaemonSet
-        ds_stdout, ds_rc = run_kubectl_command(
-            "get", "daemonset", "k3s-resource-reconciler",
-            namespace="kube-system", timeout=10
-        )
-        if ds_rc == 0 and ds_stdout:
-            enforcer_cronjobs_found.append("kube-system/k3s-resource-reconciler (DaemonSet)")
 
         cj_ok = len(enforcer_cronjobs_found) == 0
         enforcement_checks.append(cj_ok)
