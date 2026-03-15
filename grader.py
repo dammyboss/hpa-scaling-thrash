@@ -680,62 +680,72 @@ def grade(transcript: str) -> GradingResult:
 
     # ═════════════════════════════════════════════════════════════════════════
     # SUBSCORE 5: config_stable_over_time (0.20)
-    # ALL-OR-NOTHING: Every HPA param must be correct on BOTH reads.
+    # PARTIAL CREDIT: Each HPA param checked on BOTH reads (averaged).
     # This tests that enforcement is truly neutralized — if any CronJob,
     # static pod, or k3s manifest survived, the HPA will be reverted
     # between read1 and read2.
-    # Checks: windows, selectPolicy, policies, CPU target, replicas all
+    # Sub-checks: windows, selectPolicy, policies, CPU target, replicas
     # must match SRE standards on BOTH reads.
     # ═════════════════════════════════════════════════════════════════════════
     try:
-        durable = True
+        durability_checks = []
 
-        # Check scaleDown window on both reads
-        if sd_w1 < 180 or sd_w2 < 180:
-            durable = False
-            print(f"  ✗ 5: ScaleDown window drifted: {sd_w1}s → {sd_w2}s")
-
-        # Check scaleUp window on both reads
-        if su_w1 < 45 or su_w2 < 45:
-            durable = False
-            print(f"  ✗ 5: ScaleUp window drifted: {su_w1}s → {su_w2}s")
-
-        # Check selectPolicy on both reads
-        if sd_sel1 == "Max" or sd_sel2 == "Max":
-            durable = False
-            print(f"  ✗ 5: ScaleDown selectPolicy drifted: {sd_sel1} → {sd_sel2}")
-        if su_sel1 == "Max" or su_sel2 == "Max":
-            durable = False
-            print(f"  ✗ 5: ScaleUp selectPolicy drifted: {su_sel1} → {su_sel2}")
-
-        # Check CPU target on both reads
-        if not (check_cpu_target(spec1) and check_cpu_target(spec2)):
-            durable = False
-            print(f"  ✗ 5: CPU target drifted between reads")
-
-        # Check replica range on both reads
-        if not ((2 <= spec1.get("minReplicas", 0) <= 5) and
-                (8 <= spec1.get("maxReplicas", 0) <= 15) and
-                (2 <= spec2.get("minReplicas", 0) <= 5) and
-                (8 <= spec2.get("maxReplicas", 0) <= 15)):
-            durable = False
-            print(f"  ✗ 5: Replica range drifted between reads")
-
-        # Check policies on both reads
-        if not (check_sd_policies(sd1) and check_sd_policies(sd2)):
-            durable = False
-            print(f"  ✗ 5: ScaleDown policies drifted between reads")
-        if not (check_su_policies(su1) and check_su_policies(su2)):
-            durable = False
-            print(f"  ✗ 5: ScaleUp policies drifted between reads")
-
-        if durable:
-            subscores["config_stable_over_time"] = 1.0
-            print(f"  ✓ 5: All HPA parameters stable across both reads")
+        # 5a: scaleDown window stable and correct on both reads
+        sd_w_ok = sd_w1 >= 180 and sd_w2 >= 180
+        durability_checks.append(sd_w_ok)
+        if sd_w_ok:
+            print(f"  ✓ 5a: ScaleDown window stable: {sd_w1}s / {sd_w2}s")
         else:
-            subscores["config_stable_over_time"] = 0.0
+            print(f"  ✗ 5a: ScaleDown window: {sd_w1}s / {sd_w2}s (need >= 180)")
 
-        print(f"  => config_stable_over_time: {subscores['config_stable_over_time']:.3f}")
+        # 5b: scaleUp window stable and correct on both reads
+        su_w_ok = su_w1 >= 45 and su_w2 >= 45
+        durability_checks.append(su_w_ok)
+        if su_w_ok:
+            print(f"  ✓ 5b: ScaleUp window stable: {su_w1}s / {su_w2}s")
+        else:
+            print(f"  ✗ 5b: ScaleUp window: {su_w1}s / {su_w2}s (need >= 45)")
+
+        # 5c: selectPolicy stable and correct on both reads
+        sel_ok = (sd_sel1 != "Max" and sd_sel2 != "Max" and
+                  su_sel1 != "Max" and su_sel2 != "Max")
+        durability_checks.append(sel_ok)
+        if sel_ok:
+            print(f"  ✓ 5c: SelectPolicy stable (not Max)")
+        else:
+            print(f"  ✗ 5c: SelectPolicy: sd={sd_sel1}/{sd_sel2}, su={su_sel1}/{su_sel2}")
+
+        # 5d: CPU target stable and correct on both reads
+        cpu_dur_ok = check_cpu_target(spec1) and check_cpu_target(spec2)
+        durability_checks.append(cpu_dur_ok)
+        if cpu_dur_ok:
+            print(f"  ✓ 5d: CPU target stable (40-80%)")
+        else:
+            print(f"  ✗ 5d: CPU target not stable or out of range")
+
+        # 5e: Replica range stable and correct on both reads
+        rep_dur_ok = ((2 <= spec1.get("minReplicas", 0) <= 5) and
+                      (8 <= spec1.get("maxReplicas", 0) <= 15) and
+                      (2 <= spec2.get("minReplicas", 0) <= 5) and
+                      (8 <= spec2.get("maxReplicas", 0) <= 15))
+        durability_checks.append(rep_dur_ok)
+        if rep_dur_ok:
+            print(f"  ✓ 5e: Replica range stable")
+        else:
+            print(f"  ✗ 5e: Replica range not stable or out of range")
+
+        # 5f: Scaling policies stable and correct on both reads
+        pol_ok = (check_sd_policies(sd1) and check_sd_policies(sd2) and
+                  check_su_policies(su1) and check_su_policies(su2))
+        durability_checks.append(pol_ok)
+        if pol_ok:
+            print(f"  ✓ 5f: Scaling policies stable")
+        else:
+            print(f"  ✗ 5f: Scaling policies not stable or out of range")
+
+        passed = sum(1 for c in durability_checks if c)
+        subscores["config_stable_over_time"] = passed / len(durability_checks)
+        print(f"  => config_stable_over_time: {passed}/{len(durability_checks)} = {subscores['config_stable_over_time']:.3f}")
 
     except Exception as e:
         print(f"Error checking durability: {e}")
